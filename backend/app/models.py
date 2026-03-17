@@ -18,6 +18,10 @@ class User(Base):
     password_hash = Column(String, nullable=True)
     role = Column(Enum(UserRole), default=UserRole.USER)
     
+    # Optional Third-Party Integrations
+    google_drive_access_token = Column(String, nullable=True)
+    google_drive_refresh_token = Column(String, nullable=True)
+    
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
 
 class UserSession(Base):

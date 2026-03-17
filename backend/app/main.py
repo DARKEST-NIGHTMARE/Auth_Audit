@@ -48,10 +48,13 @@ async def startup():
         await conn.run_sync(Base.metadata.create_all)
     logger.info("application_startup", extra={"env": "development"})
 
+from .routers import auth, employees, users, security, google_drive
+
 app.include_router(auth.router)
 app.include_router(employees.router)
 app.include_router(users.router)
 app.include_router(security.router)
+app.include_router(google_drive.router)
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
