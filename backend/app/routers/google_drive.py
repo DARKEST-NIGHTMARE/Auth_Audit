@@ -3,12 +3,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 
-from app.database import get_db
+from app.core.database import get_db
 from app.models import User
 from app.services.google_drive_service import drive_service
 
 # Fixed imports: get_current_user is in dependencies
-from app.dependencies import get_current_user
+from app.core.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/drive", tags=["Google Drive"])
 
@@ -24,6 +24,18 @@ async def get_db_user(payload: dict = Depends(get_current_user), db: AsyncSessio
 class DriveCodeRequest(BaseModel):
     code: str
 
+@router.post("/create-folder")
+async def create_folder(name: str = "Auth Audit Workspace", db: AsyncSession = Depends(get_db), current_user: User = Depends(get_db_user)):
+    if not current_user.google_drive_access_token:
+        raise HTTPException(status_code=400, detail="Google Drive is not connected")
+    
+    folder = drive_service.create_folder(
+        name=name,
+        access_token=current_user.google_drive_access_token,
+        refresh_token=current_user.google_drive_refresh_token
+    )
+    return folder
+
 @router.get("/auth-url")
 async def get_drive_auth_url(current_user: User = Depends(get_db_user)):
     url = drive_service.get_auth_url()
@@ -36,7 +48,7 @@ async def drive_callback(
     current_user: User = Depends(get_db_user)
 ):
     """Exchanges code for tokens and saves them to the current user."""
-    tokens = drive_service.exchange_code(request.code)
+    tokens = await drive_service.exchange_code(request.code)
     
     current_user.google_drive_access_token = tokens["access_token"]
     if tokens.get("refresh_token"):

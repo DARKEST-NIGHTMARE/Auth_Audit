@@ -6,8 +6,9 @@ import uuid
 import os
 import shutil
 from datetime import datetime, timezone
-from .. import models, schemas, database, dependencies
-from ..config import settings
+from .. import models, schemas
+from ..core import database, dependencies, config
+settings = config.settings
 from ..services.security_service import SecurityService 
 from ..models import EventType
 from ..logger import get_logger

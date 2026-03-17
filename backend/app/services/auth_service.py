@@ -57,7 +57,7 @@ class AuthService:
         # Return user for 2FA step — do NOT finalize login yet
         return db_user
 
-    async def authenticate_google(self, code: str, client_ip: str, location_str: str, location_source: str, lat: float, lon: float, device_info: str):
+    async def _get_google_tokens(self, code: str):
         token_url = "https://oauth2.googleapis.com/token"
         token_data = {
             "client_id": settings.google_client_id,
@@ -81,7 +81,7 @@ class AuthService:
         user_info_res.raise_for_status() # Raise an exception for bad status codes
         return user_info_res.json()
 
-    async def authenticate_google(self, code: str, client_ip: str, location_str: str, location_source: str, lat, lon, device_info: str):
+    async def authenticate_google(self, code: str, client_ip: str, location_str: str, location_source: str, lat: float, lon: float, device_info: str):
         google_tokens = await self._get_google_tokens(code)
         access_token = google_tokens.get("access_token")
         
@@ -102,8 +102,10 @@ class AuthService:
             await self.user_repo.update(db_user, name=name, avatar_url=picture)
             print(f"Welcome back: {email}")
         
-        # We return the user. The API layer will decide if TOTP is needed.
-        return db_user
+        # Finalize login and get tokens
+        return await self._finalize_login(
+            db_user, client_ip, location_str, location_source, lat, lon, device_info, provider="google"
+        )
 
     async def authenticate_clio(self, code: str, client_ip: str, location_str: str, location_source: str, lat: float, lon: float, device_info: str):
         base_url = settings.clio_base_url

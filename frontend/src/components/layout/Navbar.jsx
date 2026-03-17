@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Link, useNavigate } from "react-router-dom";
+import { Link } from "react-router-dom";
 import styles from "../Navbar.module.css";
 
 const BACKEND_URL = process.env.REACT_APP_API_URL || 'http://localhost:8081';
@@ -7,7 +7,6 @@ const BACKEND_URL = process.env.REACT_APP_API_URL || 'http://localhost:8081';
 const Navbar = ({ user, onLogout, activePage }) => {
     const [showDropdown, setShowDropdown] = useState(false);
     const dropdownRef = useRef(null);
-    const navigate = useNavigate();
 
     const avatarSrc = (u) => {
         if (!u.avatar_url) return `https://ui-avatars.com/api/?name=${u.name}`;

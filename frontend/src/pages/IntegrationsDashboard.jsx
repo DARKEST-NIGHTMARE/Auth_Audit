@@ -1,44 +1,42 @@
-import React, { useState, useEffect } from "react";
-import { useSelector } from "react-redux";
+import React, { useState, useEffect, useCallback } from "react";
 import { googleDriveApi } from "../services/googleDriveApi";
 import buttonStyles from "../components/common/Button.module.css";
 import layoutStyles from "../components/common/Layout.module.css";
-import styles from "./Dashboard.module.css"; // Reuse dashboard styles for consistency
 
 const IntegrationsDashboard = () => {
-    const { user } = useSelector((state) => state.auth);
     const [driveConnected, setDriveConnected] = useState(false);
     const [folders, setFolders] = useState([]);
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState("drive");
     const [analysis, setAnalysis] = useState(null);
 
-    useEffect(() => {
-        checkStatus();
-    }, []);
-
-    const checkStatus = async () => {
-        try {
-            const status = await googleDriveApi.getStatus();
-            setDriveConnected(status.connected);
-            if (status.connected) {
-                fetchFolders();
-            }
-        } catch (err) {
-            console.error("Failed to check Drive status", err);
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    const fetchFolders = async () => {
+    const fetchFolders = useCallback(async () => {
         try {
             const data = await googleDriveApi.getFolders();
             setFolders(data);
         } catch (err) {
             console.error("Failed to fetch folders", err);
         }
-    };
+    }, []);
+
+    const checkStatus = useCallback(async () => {
+        try {
+            setLoading(true);
+            const status = await googleDriveApi.getStatus();
+            setDriveConnected(status.connected);
+            if (status.connected) {
+                await fetchFolders();
+            }
+        } catch (err) {
+            console.error("Failed to check Drive status", err);
+        } finally {
+            setLoading(false);
+        }
+    }, [fetchFolders]);
+
+    useEffect(() => {
+        checkStatus();
+    }, [checkStatus]);
 
     const handleConnect = async () => {
         try {
@@ -60,6 +58,22 @@ const IntegrationsDashboard = () => {
             setLoading(false);
         }
     };
+
+    const handleCreateFolder = async () => {
+        try {
+            setLoading(true);
+            await googleDriveApi.createFolder("Auth Audit Workspace");
+            await fetchFolders();
+        } catch (err) {
+            alert("Failed to create folder");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    if (loading && !folders.length && !analysis) {
+        return <div style={{ color: "white", textAlign: "center", padding: "50px" }}>Loading...</div>;
+    }
 
     return (
         <div className={layoutStyles.glassCard}>
@@ -128,7 +142,16 @@ const IntegrationsDashboard = () => {
                             </div>
 
                             {folders.length === 0 ? (
-                                <p style={{ color: "#A0AEC0" }}>No folders found in your App Folder.</p>
+                                <div style={{ textAlign: "center", padding: "30px", background: "rgba(255,255,255,0.02)", borderRadius: "12px" }}>
+                                    <p style={{ color: "#A0AEC0" }}>No folders found in your App Folder.</p>
+                                    <button 
+                                        onClick={handleCreateFolder}
+                                        className={buttonStyles.btn}
+                                        style={{ width: "auto", marginTop: "15px", background: "#48bb78" }}
+                                    >
+                                        Initialize Auth Audit Workspace
+                                    </button>
+                                </div>
                             ) : (
                                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "20px" }}>
                                     {folders.map(folder => (

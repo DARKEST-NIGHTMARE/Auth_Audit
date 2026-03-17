@@ -1,15 +1,16 @@
 import time
 import os
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 import httpx
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .core.database import engine, Base
-from .api import auth as auth_api, employees as employees_api, users as users_api, security as security_api, clio
 from .core.config import settings
 from .logger import setup_logging, get_logger
-from .routers import auth, employees, users, security, google_drive
+from .api import employees, users, security, clio
+from .routers import auth, google_drive
 
 setup_logging(level=settings.log_level if hasattr(settings, "log_level") else "INFO")
 logger = get_logger(__name__)

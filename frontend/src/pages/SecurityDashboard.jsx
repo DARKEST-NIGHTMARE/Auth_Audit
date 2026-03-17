@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { useDispatch, useSelector } from "react-redux";
+import { useSelector } from "react-redux";
 import { formatDistanceToNow } from "date-fns";
 import {
     BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
@@ -7,15 +7,12 @@ import {
 
 import { securityApi } from "../services/securityApi";
 import SecurityMap from "../components/security/SecurityMap";
-import { useNavigate } from "react-router-dom";
 import buttonStyles from "../components/common/Button.module.css";
 import layoutStyles from "../components/common/Layout.module.css";
 import employeeTableStyles from "../components/EmployeeTable.module.css";
 import styles from "./SecurityDashboard.module.css";
 
 const SecurityDashboard = () => {
-    const dispatch = useDispatch();
-
     const { user } = useSelector((state) => state.auth);
 
     // const [events, setEvents] = useState([]);
@@ -30,7 +27,6 @@ const SecurityDashboard = () => {
     const [eventTypeFilter, setEventTypeFilter] = useState("");
     const [page, setPage] = useState(0);
     const limit = 10;
-    const navigate = useNavigate();
 
     useEffect(() => {
         const fetchStaticWidgets = async () => {
