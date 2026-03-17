@@ -6,9 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .core.database import engine, Base
-from .api import auth, employees, users, security, clio
+from .api import auth as auth_api, employees as employees_api, users as users_api, security as security_api, clio
 from .core.config import settings
 from .logger import setup_logging, get_logger
+from .routers import auth, employees, users, security, google_drive
 
 setup_logging(level=settings.log_level if hasattr(settings, "log_level") else "INFO")
 logger = get_logger(__name__)
@@ -64,11 +65,14 @@ async def shutdown():
         await app.state.http_client.aclose()
         logger.info("application_shutdown", extra={"status": "http_client_closed"})
 
+# Using routers from .routers which is the newer structure
 app.include_router(auth.router)
 app.include_router(employees.router)
 app.include_router(users.router)
 app.include_router(security.router)
+app.include_router(google_drive.router)
 
+# Clio is still in .api (or check if it was moved)
 app.include_router(clio.router)
 
 @app.get("/favicon.ico", include_in_schema=False)

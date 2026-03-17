@@ -43,6 +43,9 @@ const Navbar = ({ user, onLogout, activePage }) => {
                     <Link to="/security" className={activePage === 'security' ? styles.activeLink : ''}>
                         Security
                     </Link>
+                    <Link to="/integrations" className={activePage === 'integrations' ? styles.activeLink : ''}>
+                        Integrations
+                    </Link>
                     {user.provider === 'clio' && (
                         <Link to="/clio" className={activePage === 'clio' ? styles.activeLink : ''}>
                             Clio

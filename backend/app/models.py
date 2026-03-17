@@ -21,6 +21,10 @@ class User(Base):
     # 2FA Settings
     totp_secret = Column(String, nullable=True)
     is_totp_enabled = Column(Boolean, default=False)
+
+    # Optional Third-Party Integrations
+    google_drive_access_token = Column(String, nullable=True)
+    google_drive_refresh_token = Column(String, nullable=True)
     
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
     clio_connection = relationship("ClioConnection", back_populates="user", uselist=False, cascade="all, delete-orphan")

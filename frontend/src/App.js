@@ -13,8 +13,14 @@ import MainLayout from "./components/layout/MainLayout";
 const Login = React.lazy(() => import("./pages/Login"));
 const Dashboard = React.lazy(() => import("./pages/Dashboard"));
 const Users = React.lazy(() => import("./pages/Users"));
+<<<<<<< HEAD
 const ClioDashboard = React.lazy(() => import("./pages/ClioDashboard"));
 const ProfileSettings = React.lazy(() => import("./pages/ProfileSettings"));
+=======
+const IntegrationsDashboard = React.lazy(() => import("./pages/IntegrationsDashboard"));
+const DriveCallback = React.lazy(() => import("./pages/DriveCallback"));
+const NotFound = React.lazy(() => import("./pages/NotFound"));
+>>>>>>> test
 
 function App() {
   const dispatch = useDispatch();
@@ -34,18 +40,26 @@ function App() {
           <React.Suspense fallback={<div>Loading...</div>}>
             <Routes>
               <Route path="/" element={!user ? <Login /> : <Navigate to="/dashboard" />} />
+<<<<<<< HEAD
               <Route path="/dashboard" element={<PrivateRoute><MainLayout activePage="dashboard"><Dashboard /></MainLayout></PrivateRoute>} />
               <Route path="/users" element={<PrivateRoute><MainLayout activePage="users"><Users /></MainLayout></PrivateRoute>} />
               <Route path="/security" element={<PrivateRoute><MainLayout activePage="security"><SecurityDashboard /></MainLayout></PrivateRoute>} />
               <Route path="/clio" element={<PrivateRoute><MainLayout activePage="clio"><ClioDashboard /></MainLayout></PrivateRoute>} />
               <Route path="/settings" element={<PrivateRoute><MainLayout activePage="settings"><ProfileSettings /></MainLayout></PrivateRoute>} />
+=======
+              <Route path="/dashboard" element={<PrivateRoute><Dashboard /></PrivateRoute>} />
+              <Route path="/users" element={<PrivateRoute><Users /></PrivateRoute>} />
+              <Route path="/integrations" element={<PrivateRoute><IntegrationsDashboard /></PrivateRoute>} />
+              <Route path="/drive/callback" element={<DriveCallback />} />
+              <Route path="/security" element={<PrivateRoute><SecurityDashboard /></PrivateRoute>} />
+>>>>>>> test
               <Route path="/auth/callback" element={<AuthCallback />} />
               <Route path="*" element={<Navigate to="/" />} />
-            </Routes>
-          </React.Suspense>
-        </ErrorBoundary>
-      </Router>
-    </div>
+            </Routes >
+          </React.Suspense >
+        </ErrorBoundary >
+      </Router >
+    </div >
   );
 }
 
