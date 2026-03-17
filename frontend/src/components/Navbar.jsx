@@ -29,6 +29,9 @@ const Navbar = ({ user, onLogout, activePage }) => {
                     <Link to="/security" className={activePage === 'security' ? styles.activeLink : ''}>
                         Security
                     </Link>
+                    <Link to="/integrations" className={activePage === 'integrations' ? styles.activeLink : ''}>
+                        Integrations
+                    </Link>
                 </div>
             </div>
 
