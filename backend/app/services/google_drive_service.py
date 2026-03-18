@@ -11,7 +11,6 @@ from app.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Essential configurations for App Folder scope
 SCOPES = [
     'https://www.googleapis.com/auth/drive.file',
     'openid',
@@ -48,7 +47,7 @@ class GoogleDriveService:
                 "access_type": "offline",
                 "include_granted_scopes": "true",
                 "prompt": "consent",
-                "state": "security_token_drive" # Simple state for tracking
+                "state": "security_token_drive" 
             }
             
             auth_url = f"https://accounts.google.com/o/oauth2/auth?{urlencode(params)}"
@@ -61,7 +60,6 @@ class GoogleDriveService:
     async def exchange_code(self, code: str):
         """Exchanges authorization code for access and refresh tokens manually."""
         try:
-            # Using httpx for manual exchange to avoid PKCE 'Missing code verifier' issues with Google Flow objects
             import httpx
             
             data = {
@@ -82,7 +80,7 @@ class GoogleDriveService:
             tokens = response.json()
             return {
                 "access_token": tokens.get("access_token"),
-                "refresh_token": tokens.get("refresh_token"), # Usually only present on first consent
+                "refresh_token": tokens.get("refresh_token"), 
             }
         except Exception as e:
             logger.error(f"Error in manual Drive code exchange: {e}")
@@ -108,7 +106,7 @@ class GoogleDriveService:
             results = service.files().list(
                 q="mimeType='application/vnd.google-apps.folder' and trashed=false",
                 pageSize=100,
-                fields="nextPageToken, files(id, name, createdTime, modifiedTime)",
+                fields="nextPageToken, files(id, name, createdTime, modifiedTime, parents)",
                 orderBy="name"
             ).execute()
             
@@ -154,7 +152,7 @@ class GoogleDriveService:
             logger.error(f"Google Drive Analyze Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    def create_folder(self, name: str, access_token: str, refresh_token: str = None):
+    def create_folder(self, name: str, access_token: str, refresh_token: str = None, parent_id: str = None):
         """Creates a new folder in the user's Drive."""
         try:
             service = self.get_client(access_token, refresh_token)
@@ -162,11 +160,68 @@ class GoogleDriveService:
                 'name': name,
                 'mimeType': 'application/vnd.google-apps.folder'
             }
+            if parent_id:
+                file_metadata['parents'] = [parent_id]
+                
             folder = service.files().create(body=file_metadata, fields='id, name').execute()
             logger.info(f"Created folder: {folder.get('name')} (ID: {folder.get('id')})")
             return folder
         except Exception as e:
             logger.error(f"Google Drive Create Folder Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    def create_file(self, name: str, content: str, access_token: str, refresh_token: str = None, parent_id: str = None):
+        """Creates a new text file in the user's Drive."""
+        try:
+            from googleapiclient.http import MediaInMemoryUpload
+            service = self.get_client(access_token, refresh_token)
+            
+            file_metadata = {
+                'name': name,
+                'mimeType': 'text/plain'
+            }
+            if parent_id:
+                file_metadata['parents'] = [parent_id]
+                
+            media = MediaInMemoryUpload(content.encode('utf-8'), mimetype='text/plain', resumable=True)
+            file = service.files().create(body=file_metadata, media_body=media, fields='id, name').execute()
+            logger.info(f"Created file: {file.get('name')} (ID: {file.get('id')})")
+            return file
+        except Exception as e:
+            logger.error(f"Google Drive Create File Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    def trash_item(self, file_id: str, access_token: str, refresh_token: str = None):
+        """Moves a file or folder to the trash."""
+        try:
+            service = self.get_client(access_token, refresh_token)
+            service.files().update(fileId=file_id, body={'trashed': True}).execute()
+            logger.info(f"Trashed item: {file_id}")
+            return {"status": "success", "message": "Item moved to trash"}
+        except Exception as e:
+            logger.error(f"Google Drive Trash Item Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    def upload_file(self, file_content: bytes, filename: str, mime_type: str, access_token: str, refresh_token: str = None, parent_id: str = None):
+        """Uploads a file to the user's Drive."""
+        try:
+            from googleapiclient.http import MediaIoBaseUpload
+            import io
+            service = self.get_client(access_token, refresh_token)
+            
+            file_metadata = {
+                'name': filename
+            }
+            if parent_id:
+                file_metadata['parents'] = [parent_id]
+                
+            fh = io.BytesIO(file_content)
+            media = MediaIoBaseUpload(fh, mimetype=mime_type, resumable=True)
+            file = service.files().create(body=file_metadata, media_body=media, fields='id, name').execute()
+            logger.info(f"Uploaded file: {file.get('name')} (ID: {file.get('id')})")
+            return file
+        except Exception as e:
+            logger.error(f"Google Drive Upload File Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 drive_service = GoogleDriveService()

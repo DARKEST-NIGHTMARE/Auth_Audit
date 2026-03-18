@@ -11,8 +11,32 @@ export const googleDriveApi = {
         return response.data;
     },
 
-    createFolder: async (name) => {
-        const response = await api.post("/api/drive/create-folder", null, { params: { name } });
+    createFolder: async (name, parentId = null) => {
+        const response = await api.post("/api/drive/create-folder", { name, parent_id: parentId });
+        return response.data;
+    },
+
+    createFile: async (name, content, parentId = null) => {
+        const response = await api.post("/api/drive/create-file", { name, content, parent_id: parentId });
+        return response.data;
+    },
+
+    deleteItem: async (itemId) => {
+        const response = await api.delete(`/api/drive/items/${itemId}`);
+        return response.data;
+    },
+
+    uploadFile: async (file, parentId = null) => {
+        const formData = new FormData();
+        formData.append("file", file);
+        if (parentId) {
+            formData.append("parent_id", parentId);
+        }
+        const response = await api.post("/api/drive/upload-file", formData, {
+            headers: {
+                "Content-Type": "multipart/form-data"
+            }
+        });
         return response.data;
     },
 

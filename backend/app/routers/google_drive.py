@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -7,7 +7,6 @@ from app.core.database import get_db
 from app.models import User
 from app.services.google_drive_service import drive_service
 
-# Fixed imports: get_current_user is in dependencies
 from app.core.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/drive", tags=["Google Drive"])
@@ -24,17 +23,72 @@ async def get_db_user(payload: dict = Depends(get_current_user), db: AsyncSessio
 class DriveCodeRequest(BaseModel):
     code: str
 
+class DriveItemCreate(BaseModel):
+    name: str
+    content: str | None = None
+    parent_id: str | None = None
+
+    class Config:
+        extra = "ignore" 
+
 @router.post("/create-folder")
-async def create_folder(name: str = "Auth Audit Workspace", db: AsyncSession = Depends(get_db), current_user: User = Depends(get_db_user)):
+async def create_folder(item: DriveItemCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_db_user)):
     if not current_user.google_drive_access_token:
         raise HTTPException(status_code=400, detail="Google Drive is not connected")
     
     folder = drive_service.create_folder(
-        name=name,
+        name=item.name,
+        access_token=current_user.google_drive_access_token,
+        refresh_token=current_user.google_drive_refresh_token,
+        parent_id=item.parent_id
+    )
+    return folder
+
+@router.post("/create-file")
+async def create_file(item: DriveItemCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_db_user)):
+    if not current_user.google_drive_access_token:
+        raise HTTPException(status_code=400, detail="Google Drive is not connected")
+    
+    file = drive_service.create_file(
+        name=item.name,
+        content=item.content or "Empty audit report",
+        access_token=current_user.google_drive_access_token,
+        refresh_token=current_user.google_drive_refresh_token,
+        parent_id=item.parent_id
+    )
+    return file
+
+@router.delete("/items/{item_id}")
+async def delete_item(item_id: str, current_user: User = Depends(get_db_user)):
+    if not current_user.google_drive_access_token:
+        raise HTTPException(status_code=400, detail="Google Drive is not connected")
+        
+    result = drive_service.trash_item(
+        file_id=item_id,
         access_token=current_user.google_drive_access_token,
         refresh_token=current_user.google_drive_refresh_token
     )
-    return folder
+    return result
+
+@router.post("/upload-file")
+async def upload_file(
+    parent_id: str | None = Form(None),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_db_user)
+):
+    if not current_user.google_drive_access_token:
+        raise HTTPException(status_code=400, detail="Google Drive is not connected")
+    
+    content = await file.read()
+    uploaded_file = drive_service.upload_file(
+        file_content=content,
+        filename=file.filename,
+        mime_type=file.content_type,
+        access_token=current_user.google_drive_access_token,
+        refresh_token=current_user.google_drive_refresh_token,
+        parent_id=parent_id
+    )
+    return uploaded_file
 
 @router.get("/auth-url")
 async def get_drive_auth_url(current_user: User = Depends(get_db_user)):
