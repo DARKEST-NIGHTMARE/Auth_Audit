@@ -115,6 +115,21 @@ class GoogleDriveService:
             logger.error(f"Google Drive List Folders Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    def list_all_files(self, access_token: str, refresh_token: str = None):
+        try:
+            service = self.get_client(access_token, refresh_token)
+            results = service.files().list(
+                q="trashed=false",
+                pageSize=200,
+                fields="nextPageToken, files(id, name, mimeType)",
+                orderBy="name"
+            ).execute()
+            
+            return results.get('files', [])
+        except Exception as e:
+            logger.error(f"Google Drive List All Files Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     def analyze_folder(self, folder_id: str, access_token: str, refresh_token: str = None):
         try:
             service = self.get_client(access_token, refresh_token)

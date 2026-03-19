@@ -10,7 +10,7 @@ from .core.database import engine, Base
 from .core.config import settings
 from .logger import setup_logging, get_logger
 from .api import employees, users, security, clio
-from .routers import auth, google_drive
+from .routers import auth, google_drive, summarization
 
 setup_logging(level=settings.log_level if hasattr(settings, "log_level") else "INFO")
 logger = get_logger(__name__)
@@ -72,6 +72,7 @@ app.include_router(employees.router)
 app.include_router(users.router)
 app.include_router(security.router)
 app.include_router(google_drive.router)
+app.include_router(summarization.router)
 
 # Clio is still in .api (or check if it was moved)
 app.include_router(clio.router)

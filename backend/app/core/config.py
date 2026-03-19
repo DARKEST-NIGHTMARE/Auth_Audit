@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     clio_client_secret: str
     clio_redirect_uri: str
     clio_base_url: str = "https://app.clio.com"
+
+    gemini_api_key: str = ""
     
     # class Coonfig:
     #     # env_file = ".env"
