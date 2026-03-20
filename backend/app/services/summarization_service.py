@@ -12,12 +12,14 @@ Core components:
 import re
 import os
 import io
+import json
 import hashlib
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from enum import Enum
 from dataclasses import dataclass, field
 from rapidfuzz import fuzz
+import httpx
 
 class DocumentType(str, Enum):
     LEGAL_CASE = "legal_case"
@@ -29,7 +31,84 @@ from app.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ─── Gemini Client ────────────────────────────────────────────────────────────
+# ─── Local Embedding Client ───────────────────────────────────────────────────
+
+class LocalEmbeddingClient:
+    """Provides local sentence embeddings to bypass API rate limits."""
+    
+    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
+        self.model_name = model_name
+        self._model = None
+        
+    @property
+    def model(self):
+        if self._model is None:
+            try:
+                from fastembed import TextEmbedding
+                logger.info(f"Initializing Local Embedding Model: {self.model_name}")
+                self._model = TextEmbedding(model_name=self.model_name)
+            except ImportError:
+                logger.warning("fastembed not installed. Falling back to API embeddings.")
+                return None
+        return self._model
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings locally."""
+        model = self.model
+        if model:
+            # fastembed returns an iterator of arrays
+            return [list(e) for e in model.embed(texts)]
+        return []
+
+        return []
+
+class CerebrasClient:
+    """Wraps Cerebras Cloud API for high-speed text generation via direct REST calls."""
+    
+    def __init__(self):
+        self.api_key = settings.cerebras_api_key
+        self.api_url = "https://api.cerebras.ai/v1/chat/completions"
+
+    async def generate(self, prompt: str, system_instruction: Optional[str] = None) -> str:
+        """Generate text using direct HTTP POST to Cerebras."""
+        if not self.api_key:
+            raise RuntimeError("CEREBRAS_API_KEY missing.")
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": settings.cerebras_model, # Dynamic model selection
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                response = await client.post(self.api_url, headers=headers, json=payload)
+                
+                if response.status_code == 401:
+                    logger.error("Cerebras Authentication Failed: Invalid API Key")
+                    raise RuntimeError("Cerebras Authentication Error")
+                
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                logger.info("Cerebras request successful.")
+                return content
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Cerebras API Error ({e.response.status_code}): {e.response.text}")
+                raise
+            except Exception as e:
+                logger.error(f"Cerebras Connection Error: {e}")
+                raise
 
 class GeminiClient:
     """Wraps Google Gemini API for text generation and embeddings."""
@@ -46,101 +125,87 @@ class GeminiClient:
             self._client = genai.Client(api_key=settings.gemini_api_key)
         return self._client
 
-    def generate(self, prompt: str, system_instruction: str = None) -> str:
-        """Generate text using Gemini."""
-        try:
-            config = {}
-            if system_instruction:
-                from google.genai import types
-                config = types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.1,
-                    max_output_tokens=4096,
-                )
-            
-            response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=config if config else None,
-            )
-            return response.text
-        except Exception as e:
-            logger.error(f"Gemini generation error: {e}")
-            raise
+    def _is_hard_quota_error(self, error: Exception) -> bool:
+        """Detect if the error is a hard quota exhaustion (not just a temporary rate limit)."""
+        err_str = str(error).lower()
+        hard_signals = [
+            "quota exceeded for metric",
+            "daily limit",
+            "requests per day",
+            "limit: 0",
+            "billing details",
+        ]
+        return any(signal in err_str for signal in hard_signals)
+
+    def generate(self, prompt: str, system_instruction: Optional[str] = None) -> str:
+        """Disabled for text generation to prevent quota exhaustion - use Cerebras."""
+        logger.error("DISABLED ACTION: Gemini generation called. Redirecting to exception.")
+        raise RuntimeError("Gemini generation disabled - use Cerebras")
 
     def embed(self, text: str) -> List[float]:
-        """Generate a single embedding via REST fallback."""
-        import requests
-        model_name = "models/embedding-001"
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:embedContent?key={settings.gemini_api_key}"
+        """Generate a single embedding via SDK with confirmed model."""
         try:
-            payload = {
-                "model": model_name,
-                "content": {"parts": [{"text": text}]}
-            }
-            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-            if res.status_code == 200:
-                return res.json()["embedding"]["values"]
-            else:
-                logger.error(f"Gemini embed HTTP error: {res.text}")
-                return [0.0] * 768
+            # Using the confirmed available model (gemini-embedding-001)
+            response = self.client.models.embed_content(
+                model="models/gemini-embedding-001",
+                contents=text
+            )
+            return response.embeddings[0].values
         except Exception as e:
             logger.error(f"Gemini embed exception: {e}")
             return [0.0] * 768
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts using batchEmbedContents REST API."""
-        import requests
+        """Generate embeddings for multiple texts by looping manually."""
         import time
         if not texts:
             return []
 
         all_embeddings = []
-        model_name = "models/embedding-001"
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:batchEmbedContents?key={settings.gemini_api_key}"
+        logger.info(f"Starting manual embedding loop for {len(texts)} chunks...")
         
-        # Batch size limit for Gemini is 100
-        batch_size = 100
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
-            payload = {
-                "requests": [
-                    {
-                        "model": model_name,
-                        "content": {"parts": [{"text": txt}]}
-                    } for txt in batch_texts
-                ]
-            }
-            
+        for i, text in enumerate(texts):
             try:
-                # Add a tiny 0.5s baseline pause between batches
                 if i > 0:
-                    time.sleep(0.5)
-
-                # Retry loop for 429s
-                max_retries = 3
-                for retry in range(max_retries):
-                    res = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-                    if res.status_code == 200:
-                        batch_res = res.json().get("embeddings", [])
-                        all_embeddings.extend([e["values"] for e in batch_res])
-                        break
-                    elif res.status_code == 429:
-                        wait_time = (retry + 1) * 2
-                        logger.warning(f"Quota exceeded (429). Retrying in {wait_time}s...")
-                        time.sleep(wait_time)
-                        if retry == max_retries - 1:
-                            logger.error("Max retries reached for 429. Filling with zeros.")
-                            all_embeddings.extend([[0.0] * 768] * len(batch_texts))
-                    else:
-                        logger.error(f"Gemini batch embed HTTP error: {res.text}")
-                        all_embeddings.extend([[0.0] * 768] * len(batch_texts))
-                        break
+                    time.sleep(4.0) # 15 RPM safety
+                emb = self.embed(text)
+                all_embeddings.append(emb)
             except Exception as e:
-                logger.error(f"Gemini batch embed exception: {e}")
-                all_embeddings.extend([[0.0] * 768] * len(batch_texts))
-                
+                logger.error(f"Manual embed error at chunk {i}: {e}")
+                all_embeddings.append([0.0] * 768)
         return all_embeddings
+
+# ─── Centralized Generation Engine ────────────────────────────────────────────
+
+async def generate_text(prompt: str, system_instruction: Optional[str] = None) -> str:
+    """Routes ALL text generation tasks exclusively to Cerebras via REST."""
+    if not settings.cerebras_api_key:
+        logger.error("CEREBRAS_API_KEY missing - generation aborted.")
+        raise RuntimeError("CEREBRAS_API_KEY not configured")
+
+    logger.info("Using Cerebras for generation...")
+    cerebras = CerebrasClient()
+    
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            return await cerebras.generate(prompt, system_instruction=system_instruction)
+        except (RuntimeError, ValueError) as e:
+            # Config/Auth errors: FAIL FAST
+            logger.error(f"Cerebras Config/Auth Error: {e}. No retry.")
+            raise
+        except Exception as e:
+            # Network/Server errors: RETRY
+            if attempt < max_retries:
+                wait = 2.0 * (attempt + 1)
+                logger.warning(f"Cerebras transient failure (attempt {attempt+1}). Retrying in {wait}s... Error: {e}")
+                await asyncio.sleep(wait)
+                continue
+            logger.error(f"Cerebras exhausted all {max_retries+1} attempts. Failing over to local summary.")
+            raise RuntimeError(f"Cerebras exhausted retries: {e}")
+
+    # Safety fallback if loop somehow exits without return/raise
+    raise RuntimeError("Cerebras generation failed - unknown error state")
 
 
 # ─── Document Chunker ─────────────────────────────────────────────────────────
@@ -203,7 +268,7 @@ class DocumentChunker:
                     if overlap_chars >= overlap_limit:
                         start = j
                         break
-                current = current[start:]
+                current = current[int(start):]
                 current_len = sum(len(s) for s in current)
             current.append(sent)
             current_len += sent_len
@@ -218,7 +283,7 @@ class DocumentChunker:
 class TextExtractor:
     """Extracts text from various file types."""
 
-    def extract_from_bytes(self, content: bytes, mime_type: str, filename: str = "") -> str:
+    async def extract_from_bytes(self, content: bytes, mime_type: str, filename: str = "") -> str:
         """Route to the correct extractor based on MIME type."""
         mime_lower = mime_type.lower() if mime_type else ""
         filename_lower = filename.lower()
@@ -230,7 +295,7 @@ class TextExtractor:
             return ""
 
         if "pdf" in mime_lower:
-            return self._extract_pdf(content)
+            return await self._extract_pdf(content)
         elif "wordprocessingml" in mime_lower or "docx" in (filename.split('.')[-1:] or [""]):
             return self._extract_docx(content)
         elif "text" in mime_lower or "plain" in mime_lower:
@@ -247,7 +312,7 @@ class TextExtractor:
             except Exception:
                 return ""
 
-    def _extract_pdf(self, content: bytes) -> str:
+    async def _extract_pdf(self, content: bytes) -> str:
         try:
             import pdfplumber
             with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -299,6 +364,7 @@ class VectorStoreManager:
         self._client = None
         self._collection = None
         self.gemini = gemini_client
+        self.local_embedder = LocalEmbeddingClient()
         self._db_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
             "chroma_data"
@@ -308,16 +374,34 @@ class VectorStoreManager:
     def collection(self):
         if self._collection is None:
             import chromadb
-            self._client = chromadb.PersistentClient(path=self._db_path)
-            self._collection = self._client.get_or_create_collection(
-                name=self.COLLECTION_NAME,
-                metadata={"hnsw:space": "cosine"}
-            )
+            try:
+                self._client = chromadb.PersistentClient(path=self._db_path)
+                self._collection = self._client.get_or_create_collection(
+                    name=self.COLLECTION_NAME,
+                    metadata={"hnsw:space": "cosine"}
+                )
+            except Exception as e:
+                logger.error(f"ChromaDB initialization error: {e}")
+                raise
         return self._collection
 
-    def add_chunks(self, chunks: List[Chunk], embeddings: List[List[float]]):
-        """Store chunks with their embeddings."""
+    def add_chunks(self, chunks: List[Chunk], embeddings: Optional[List[List[float]]] = None):
+        """Store chunks with their embeddings, using local embeddings if available."""
         if not chunks:
+            return
+
+        # If embeddings aren't provided, try local generation to save API quota
+        if not embeddings:
+            texts = [c.text for c in chunks]
+            embeddings = self.local_embedder.embed_texts(texts)
+            
+        # If still no embeddings (local failed), use API
+        if not embeddings:
+            texts = [c.text for c in chunks]
+            embeddings = self.gemini.embed_batch(texts)
+
+        if not embeddings:
+            logger.error("Failed to generate embeddings for chunks.")
             return
 
         ids = [f"{c.file_id}_chunk_{c.chunk_index}" for c in chunks]
@@ -327,13 +411,32 @@ class VectorStoreManager:
             for c in chunks
         ]
 
-        self.collection.upsert(
-            ids=ids,
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas,
-        )
-        logger.info(f"Stored {len(chunks)} chunks in ChromaDB")
+        try:
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                documents=documents,
+                metadatas=metadatas,
+            )
+            logger.info(f"Stored {len(chunks)} chunks in ChromaDB")
+        except Exception as e:
+            if "dimension" in str(e).lower():
+                logger.warning(f"Dimension mismatch detected: {e}. Recreating collection...")
+                self._client.delete_collection(self.COLLECTION_NAME)
+                self._collection = self._client.create_collection(
+                    name=self.COLLECTION_NAME,
+                    metadata={"hnsw:space": "cosine"}
+                )
+                # Retry once after recreate
+                self._collection.upsert(
+                    ids=ids,
+                    embeddings=embeddings,
+                    documents=documents,
+                    metadatas=metadatas,
+                )
+                logger.info(f"Successfully recreated collection and stored {len(chunks)} chunks.")
+            else:
+                raise
 
     def query(self, query_text: str, file_ids: List[str] = None, top_k: int = 15) -> dict:
         """Query similar chunks."""
@@ -457,27 +560,73 @@ class QueryParser:
 class PromptBuilder:
     """Consolidates prompts for legal and general RAG flows."""
 
-    # Specialized System Instructions
-    LEGAL_SYSTEM_INSTRUCTION = """You are a senior legal analyst preparing concise, accurate notes for Indian judiciary exams.
-Your task is to analyze judicial excerpts and produce a structured, professional legal summary.
-
-STRICT RULES:
-1. ONLY use information from the provided excerpts.
-2. If a section (e.g. "Arguments") is missing from the excerpts, say: "Not explicitly mentioned in the provided text."
-3. TONE: Formal, authoritative, and precise.
-4. LANGUAGE: Use professional legal terminology (e.g. "Ratio Decidendi", "Inter alia").
-5. ACCURACY: Do not hallucinate or extrapolate beyond the text.
-"""
-
-    GENERAL_SYSTEM_INSTRUCTION = """You are a professional analysis assistant with a lucid and highly readable writing style.
+    # General Prompts
+    SYSTEM_INSTRUCTION = """You are a professional analysis assistant with a lucid and highly readable writing style.
 ONLY use information from the PROVIDED CONTEXT. If the answer is not in the context, say so clearly.
 TONE: Professional, concise, and structured. Use clear headers and bullet points."""
 
-    # Legal Extraction Prompts
-    LEGAL_SECTION_PROMPT = """TASK: Extract ONLY the {section_name} from the provided case excerpts.
+    GENERAL_SYSTEM_INSTRUCTION = SYSTEM_INSTRUCTION
 
-SECTION TO EXTRACT: {section_name}
-{section_description}
+    # Specialized System Instructions
+    LEGAL_SYSTEM_INSTRUCTION = """You are a senior legal analyst preparing concise, accurate notes for Indian judiciary exams.
+    Your task is to analyze judicial excerpts and produce a structured, professional legal summary.
+
+    STRICT RULES:
+    1. ONLY use information from the provided excerpts.
+    2. If a section (e.g. "Arguments") is missing from the excerpts, say: "Not explicitly mentioned in the provided text."
+    3. TONE: Formal, authoritative, and precise.
+    4. LANGUAGE: Use professional legal terminology (e.g. "Ratio Decidendi", "Inter alia").
+    5. ACCURACY: Do not hallucinate or extrapolate beyond the text.
+    """
+
+    JSON_FORMAT_INSTRUCTION = """
+IMPORTANT: Return your output strictly as a JSON object with these keys:
+- "summary": The structured text response in markdown format.
+- "suggested_questions": A clean array of 3-5 strings (no bullet points or numbers).
+Do NOT include any text before or after the JSON block."""
+
+
+    FOLDER_SUMMARY_PROMPT = """TASK: Provide a high-level summary of the folder "{folder_name}" based on the summaries of its contents.
+
+{json_instruction}
+
+FILE SUMMARIES:
+---
+{combined_text}
+---
+
+INSTRUCTIONS:
+1. Synthesize the overall purpose of these {num_files} files.
+2. Highlight cross-document themes or relationships.
+3. Keep it professional and concise."""
+
+    QUESTION_PROMPT = """TASK: Answer the following question based ONLY on the provided document contexts.
+
+QUESTION: {question}
+
+CONTEXTS:
+---
+{chunks_text}
+---
+
+FILES INVOLVED: {file_names}
+
+INSTRUCTIONS:
+1. Be precise and cite the relevant files in your narrative.
+2. If the answer isn't in the contexts, say: "I couldn't find information regarding this in the provided documents."
+"""
+
+    # Legal Extraction & Synthesis (All-in-One)
+    LEGAL_ALL_IN_ONE_PROMPT = """TASK: Provide a comprehensive, structured legal analysis and follow-up questions for the provided case based ONLY on the excerpts provided.
+
+{json_instruction}
+
+SUMMARY STRUCTURE:
+1. **Facts**: Background, parties, and events leading to the case.
+2. **Issues**: Core legal questions and points of law to be decided.
+3. **Arguments**: Contentions from both petitioner/appellant and respondent.
+4. **Reasoning**: The court's analysis, interpretation of law, and precedents cited.
+5. **Held**: The final decision and Ratio Decidendi (the legal principle established).
 
 EXCERPTS:
 ---
@@ -485,20 +634,9 @@ EXCERPTS:
 ---
 
 INSTRUCTIONS:
-1. Be extremely precise.
-2. If this section is not discussed in the excerpts, return: "SECTION_NOT_FOUND".
-3. Use professional legal language.
-"""
-
-    LEGAL_SYNTHESIS_PROMPT = """TASK: Synthesize the following extracted sections into a final, polished case summary.
-
-SECTIONS:
-{sections_text}
-
-INSTRUCTIONS:
-1. Format as a clean, structured legal note.
-2. Ensure logical flow between sections.
-3. Use bold headers for each section.
+1. Use professional legal terminology.
+2. Adhere STRICTLY to the provided excerpts.
+3. TONE: Formal, authoritative, and precise.
 """
 
     SUGGESTED_QUESTIONS_PROMPT = """TASK: Based ON THE SUMMARY ABOVE, generate 3-4 concise follow-up questions that a user might want to ask to explore the case further.
@@ -519,6 +657,8 @@ SUMMARY:
     # General Prompts
     GENERAL_SUMMARY_PROMPT = """TASK: Provide a lucid and professional summary of the document "{file_name}".
 
+{json_instruction}
+
 CONTEXT:
 ---
 {chunks_text}
@@ -526,24 +666,33 @@ CONTEXT:
 
 INSTRUCTIONS:
 1. Start with a high-level overview.
-2. Use bullet points for "Key Insights".
-3. Conclude with 2-3 comprehension questions."""
-
-    def build_legal_section_prompt(self, section_name: str, section_description: str, chunks_text: str) -> str:
-        return self.LEGAL_SECTION_PROMPT.format(
-            section_name=section_name, 
-            section_description=section_description, 
-            chunks_text=chunks_text
-        )
-
-    def build_legal_synthesis_prompt(self, sections_text: str) -> str:
-        return self.LEGAL_SYNTHESIS_PROMPT.format(sections_text=sections_text)
+2. Use bullet points for "Key Insights" in the summary content."""
 
     def build_judicial_question_prompt(self, summary_text: str) -> str:
         return self.SUGGESTED_QUESTIONS_PROMPT.format(summary_text=summary_text)
 
     def build_general_summary_prompt(self, file_name: str, chunks_text: str) -> str:
-        return self.GENERAL_SUMMARY_PROMPT.format(file_name=file_name, chunks_text=chunks_text)
+        return self.GENERAL_SUMMARY_PROMPT.format(
+            file_name=file_name, 
+            chunks_text=chunks_text,
+            json_instruction=self.JSON_FORMAT_INSTRUCTION
+        )
+
+    def build_folder_summary_prompt(self, folder_name: str, combined_text: str, num_files: int) -> str:
+        return self.FOLDER_SUMMARY_PROMPT.format(
+            folder_name=folder_name, 
+            combined_text=combined_text, 
+            num_files=num_files,
+            json_instruction=self.JSON_FORMAT_INSTRUCTION
+        )
+
+    def build_question_prompt(self, question: str, chunks_text: str, file_names: str) -> str:
+        return self.QUESTION_PROMPT.format(
+            question=question, 
+            chunks_text=chunks_text, 
+            file_names=file_names,
+            json_instruction=self.JSON_FORMAT_INSTRUCTION
+        )
 
 
 # ─── Summarization Pipeline ──────────────────────────────────────────────────
@@ -552,13 +701,55 @@ class SummarizationPipeline:
     """Main orchestrator: parse → resolve → ingest → retrieve → summarize."""
 
     def __init__(self):
-        self.gemini = GeminiClient()
+        self.embedding_service = GeminiClient() # Always Gemini for embeddings
         self.chunker = DocumentChunker()
         self.extractor = TextExtractor()
-        self.vector_store = VectorStoreManager(self.gemini)
+        self.vector_store = VectorStoreManager(self.embedding_service)
         self.parser = QueryParser()
         self.prompt_builder = PromptBuilder()
-        self._summary_cache = {}  # Simple in-memory cache
+        self._summary_cache: Dict[str, dict] = {}
+        self._doc_types: Dict[str, DocumentType] = {}
+
+    def _parse_llm_json(self, response_text: str) -> dict:
+        """Robustly extract and parse JSON from LLM output."""
+        try:
+            # Try plain parse first
+            return json.loads(response_text)
+        except Exception:
+            # Try extracting from markdown block
+            match = re.search(r"```json\s*(.*?)\s*```", response_text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except Exception:
+                    pass
+            
+            # Final fallback: Treat the whole thing as summary
+            return {
+                "summary": response_text,
+                "suggested_questions": []
+            }
+
+    async def _generate_with_fallback(self, prompt: str, system_instruction: str, file_name: str, fallback_text: str) -> str:
+        """Unified generator with zero-API local fallback."""
+        try:
+            return await generate_text(prompt, system_instruction=system_instruction)
+        except Exception as e:
+            logger.warning(f"Cerebras generation failed for {file_name}. Using local extraction. Error: {e}")
+            return self._local_extractive_summary(fallback_text, file_name)
+
+    def _local_extractive_summary(self, text: str, file_name: str) -> str:
+        """Generates a text-based extractive summary without any API calls."""
+        snippet = text[:1500].strip()
+        if not snippet:
+            snippet = "(No readable text found in document)"
+            
+        return (
+            f"**Notice: AI Generation Paused (Quota Stability).**\n\n"
+            f"**Preliminary Document Excerpt ({file_name}):**\n"
+            f"> {snippet}...\n\n"
+            f"*Summary generated via local extraction to prevent system throttling.*"
+        )
 
     async def _classify_document_type(self, text: str) -> DocumentType:
         """Heuristic-first classification, then LLM for confidence."""
@@ -576,7 +767,7 @@ class SummarizationPipeline:
         # 2. Lightweight LLM check if uncertain
         try:
             prompt = f"Categorize the following text as 'legal_case' or 'general_document'. Only return the label.\n\nTEXT EXCERPT:\n{text[:2000]}"
-            label = self.gemini.generate(prompt).strip().lower()
+            label = (await generate_text(prompt)).strip().lower()
             if "legal_case" in label:
                 return DocumentType.LEGAL_CASE
             return DocumentType.GENERAL_DOCUMENT
@@ -584,16 +775,12 @@ class SummarizationPipeline:
             return DocumentType.GENERAL_DOCUMENT
 
     def _generate_subqueries(self, doc_type: DocumentType, original_name: str) -> List[str]:
-        """Generate targeted sub-queries based on document type."""
+        """Generate targeted sub-queries based on document type. Consolidate for 429 resilience."""
         if doc_type == DocumentType.LEGAL_CASE:
-            return [
-                f"facts and background of the case {original_name}",
-                f"legal issues and questions of law involved in {original_name}",
-                f"arguments by appellant and respondent in {original_name}",
-                f"court reasoning and detailed analysis in {original_name}",
-                f"held ratio decidendi and final judgment in {original_name}"
-            ]
-        return [f"main summary and key overview of {original_name}", f"important details and findings in {original_name}"]
+            # Consolidate to exactly 1 query to minimize embedding calls (15 RPM limit)
+            return [f"comprehensive facts, issues, arguments, reasoning, and judgment in {original_name}"]
+        # General documents also consolidated to 1 query
+        return [f"main summary, key insights, and important findings in {original_name}"]
 
     async def _multi_query_retrieve(self, subqueries: List[str], file_id: str, top_k_per_query: int = 4) -> str:
         """Retrieve chunks for multiple queries and deduplicate."""
@@ -608,8 +795,8 @@ class SummarizationPipeline:
                         seen_ids.add(id)
                         all_docs.append((metadata.get("chunk_index", 0), doc))
             
-            # Tiny sleep to avoid slamming the embedding API if not batched
-            await asyncio.sleep(0.1)
+            # Sleep to avoid slamming the embedding API
+            await asyncio.sleep(0.5)
 
         # Sort by chunk_index to maintain document flow
         all_docs.sort(key=lambda x: x[0])
@@ -660,7 +847,7 @@ class SummarizationPipeline:
                 return {"status": "skipped", "reason": "empty", "file": name}
 
             # Extract text
-            text = self.extractor.extract_from_bytes(content_bytes, mime_type, name)
+            text = await self.extractor.extract_from_bytes(content_bytes, mime_type, name)
             if not text or len(text.strip()) < 5:
                 logger.warning(f"File '{name}' (ID: {file_id}) has insufficient text for indexing")
                 return {"status": "skipped", "reason": "no_extractable_text", "file": name}
@@ -678,7 +865,7 @@ class SummarizationPipeline:
 
             # Embed all chunks
             texts = [c.text for c in chunks]
-            embeddings = self.gemini.embed_batch(texts)
+            embeddings = self.embedding_service.embed_batch(texts)
 
             # Store in ChromaDB
             self.vector_store.add_chunks(chunks, embeddings)
@@ -874,62 +1061,57 @@ class SummarizationPipeline:
             return await self._fallback_summarization(file_id, file_name, str(e))
 
     async def _legal_synthesis_flow(self, file_id: str, file_name: str) -> dict:
-        """Deep legal analysis flow with multi-query and section-wise extraction."""
+        """Ultimate optimization: Complete legal analysis + questions in a single API pass."""
         subqueries = self._generate_subqueries(DocumentType.LEGAL_CASE, file_name)
         
-        sections = {
-            "Facts": "Background, parties, and events leading to the case.",
-            "Issues": "Core legal questions and points of law to be decided.",
-            "Arguments": "Summary of contentions from both Appellant and Respondent.",
-            "Reasoning": "The court's analysis and interpretation of law.",
-            "Held": "The final decision and Ratio Decidendi (the legal principle established)."
-        }
-
-        extracted_sections = {}
-        for section, desc in sections.items():
-            # Retrieve relevant chunks for this specific section
-            query = f"{section} and {desc} in the case of {file_name}"
-            chunks_text = await self._multi_query_retrieve([query], file_id, top_k_per_query=6)
-            
-            # Extract section
-            prompt = self.prompt_builder.build_legal_section_prompt(section, desc, chunks_text)
-            content = self.gemini.generate(prompt, system_instruction=PromptBuilder.LEGAL_SYSTEM_INSTRUCTION)
-            
-            if "SECTION_NOT_FOUND" in content or len(content.strip()) < 10:
-                extracted_sections[section] = "Not explicitly detailed in the provided excerpts."
-            else:
-                extracted_sections[section] = content
-            
-            # Rate limit safety (15 RPM limit)
-            await asyncio.sleep(2.0)
-
-        # Synthesis
-        sections_text = "\n\n".join([f"### {k}\n{v}" for k, v in extracted_sections.items()])
-        synth_prompt = self.prompt_builder.build_legal_synthesis_prompt(sections_text)
-        final_summary = self.gemini.generate(synth_prompt, system_instruction=PromptBuilder.LEGAL_SYSTEM_INSTRUCTION)
+        # Retrieve a broader context for the all-in-one pass (Optimized top_k)
+        chunks_text = await self._multi_query_retrieve(subqueries, file_id, top_k_per_query=5)
         
-        # Questions
-        q_prompt = self.prompt_builder.build_judicial_question_prompt(final_summary)
-        questions = self.gemini.generate(q_prompt)
-
+        # SINGLE ANALYSIS PASS WITH FALLBACK
+        prompt = self.prompt_builder.LEGAL_ALL_IN_ONE_PROMPT.format(chunks_text=chunks_text)
+        
+        # Fallback text logic
+        fallback_text = chunks_text[:1000] if chunks_text else "Legal document content retrieval failed."
+        
+        result_text = await self._generate_with_fallback(
+            prompt, 
+            PromptBuilder.LEGAL_SYSTEM_INSTRUCTION,
+            file_name,
+            fallback_text
+        )
+        
+        # Parse into JSON structure for frontend
+        parsed = self._parse_llm_json(result_text)
+        
         return {
             "type": "legal_case",
-            "answer": f"{final_summary}\n\n### Judicial Practice Questions\n{questions}",
+            "answer": json.dumps(parsed), # Send as JSON string for frontend to parse
             "sources": [{"file": file_name, "type": "legal"}],
             "intent": "summarize"
         }
 
     async def _general_summarization_flow(self, file_id: str, file_name: str) -> dict:
-        """Standard RAG flow for general documents."""
+        """Standard RAG flow for general documents with fallback."""
         subqueries = self._generate_subqueries(DocumentType.GENERAL_DOCUMENT, file_name)
-        chunks_text = await self._multi_query_retrieve(subqueries, file_id, top_k_per_query=8)
+        chunks_text = await self._multi_query_retrieve(subqueries, file_id, top_k_per_query=5)
         
         prompt = self.prompt_builder.build_general_summary_prompt(file_name, chunks_text)
-        answer = self.gemini.generate(prompt, system_instruction=PromptBuilder.GENERAL_SYSTEM_INSTRUCTION)
+        
+        fallback_text = chunks_text[:1000] if chunks_text else "General document content retrieval failed."
+        
+        answer_text = await self._generate_with_fallback(
+            prompt, 
+            PromptBuilder.GENERAL_SYSTEM_INSTRUCTION,
+            file_name,
+            fallback_text
+        )
+        
+        # Parse into JSON structure for frontend
+        parsed = self._parse_llm_json(answer_text)
         
         return {
             "type": "general_document",
-            "answer": answer,
+            "answer": json.dumps(parsed),
             "sources": [{"file": file_name, "type": "general"}],
             "intent": "summarize"
         }
@@ -941,11 +1123,14 @@ class SummarizationPipeline:
         text = "\n\n".join(chunks_data["documents"][:10]) # Limit to first 10 chunks
         
         prompt = f"Provide a brief summary of {file_name} based on these excerpts:\n\n{text}"
-        answer = self.gemini.generate(prompt)
+        try:
+            answer = await generate_text(prompt)
+        except Exception:
+            answer = self._local_extractive_summary(text, file_name)
         
         return {
             "type": "fallback",
-            "answer": f"**Note: Using basic summary due to system constraints.**\n\n{answer}",
+            "answer": answer,
             "sources": [{"file": file_name, "type": "fallback"}]
         }
 
@@ -965,11 +1150,17 @@ class SummarizationPipeline:
         if not files:
             return {"answer": f"Folder '{folder_name}' is empty.", "sources": []}
 
-        # Summarize each non-folder file
+        # Summarize each non-folder file with mandatory delay to avoid 429
         file_summaries = []
-        for f in files:
+        for i, f in enumerate(files):
             if "folder" in f.get("mimeType", ""):
                 continue
+            
+            # 5s delay between files to stay safely under 15 RPM
+            if i > 0:
+                logger.info(f"Rate limit cooldown: Waiting 5s before next file...")
+                await asyncio.sleep(5.0)
+                
             summary = await self._summarize_file(f["id"], f["name"])
             if summary.get("answer"):
                 file_summaries.append(f"### {f['name']}\n{summary['answer']}")
@@ -988,17 +1179,27 @@ class SummarizationPipeline:
             }
 
         prompt = self.prompt_builder.build_folder_summary_prompt(folder_name, combined, len(file_summaries))
-        answer = self.gemini.generate(prompt, system_instruction=PromptBuilder.SYSTEM_INSTRUCTION)
+        
+        answer_text = await self._generate_with_fallback(
+            prompt, 
+            PromptBuilder.SYSTEM_INSTRUCTION,
+            folder_name,
+            combined[:1500]
+        )
+
+        # Parse into JSON structure for frontend
+        parsed = self._parse_llm_json(answer_text)
 
         return {
-            "answer": answer,
+            "answer": json.dumps(parsed),
             "sources": [{"file": f["name"]} for f in files if "folder" not in f.get("mimeType", "")],
-            "intent": "summarize"
+            "intent": "summarize",
+            "type": "folder_summary"
         }
 
     async def _answer_question(self, question: str, file_ids: List[str], file_names: List[str]) -> dict:
-        """Answer a question using relevant chunks from specified files."""
-        results = self.vector_store.query(question, file_ids=file_ids, top_k=15)
+        """Answer a question using relevant chunks with quota-aware fallback."""
+        results = self.vector_store.query(question, file_ids=file_ids, top_k=5)
 
         if not results or not results.get("documents") or not results["documents"][0]:
             return {"answer": "No relevant content found to answer your question.", "sources": []}
@@ -1014,11 +1215,20 @@ class SummarizationPipeline:
         prompt = self.prompt_builder.build_question_prompt(
             question, chunks_text, ", ".join(file_names)
         )
-        answer = self.gemini.generate(prompt, system_instruction=PromptBuilder.SYSTEM_INSTRUCTION)
+        
+        answer_text = await self._generate_with_fallback(
+            prompt, 
+            PromptBuilder.SYSTEM_INSTRUCTION,
+            "Multi-File Search",
+            chunks_text[:1000]
+        )
+
+        # Parse into JSON structure for frontend
+        parsed = self._parse_llm_json(answer_text)
 
         seen_files = list({m.get("file_name", "unknown") for m in metas})
         return {
-            "answer": answer,
+            "answer": json.dumps(parsed),
             "sources": [{"file": f} for f in seen_files],
             "intent": "question"
         }

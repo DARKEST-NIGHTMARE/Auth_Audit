@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { summarizationApi } from "../../services/summarizationApi";
 
-const AssistantSuggestions = ({ questions, onQuery }) => {
+const AssistantSuggestions = ({ questions, onQuery, loading }) => {
     const [showAll, setShowAll] = useState(false);
     if (!questions || questions.length === 0) return null;
 
@@ -11,47 +11,56 @@ const AssistantSuggestions = ({ questions, onQuery }) => {
         <div style={{ 
             marginTop: "16px", 
             paddingTop: "16px",
-            borderTop: "1px solid rgba(255,255,255,0.08)"
+            borderTop: "1px solid rgba(255,255,255,0.08)",
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "8px"
         }}>
             {displayedQuestions.map((q, idx) => (
-                <div 
+                <button 
                     key={idx} 
-                    onClick={() => onQuery(q)}
+                    onClick={() => !loading && onQuery(q)}
+                    disabled={loading}
                     style={{ 
-                        display: "flex", 
-                        gap: "12px", 
-                        padding: "8px 12px", 
-                        cursor: "pointer",
-                        borderRadius: "8px",
-                        transition: "background 0.2s",
-                        marginBottom: "4px"
+                        background: "rgba(102, 126, 234, 0.1)", 
+                        border: "1px solid rgba(102, 126, 234, 0.3)",
+                        color: "#E2E8F0",
+                        padding: "6px 14px", 
+                        cursor: loading ? "wait" : "pointer",
+                        borderRadius: "20px",
+                        fontSize: "0.8rem",
+                        transition: "all 0.2s ease-in-out",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        outline: "none",
+                        opacity: loading ? 0.6 : 1
                     }}
-                    onMouseOver={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
-                    onMouseOut={e => e.currentTarget.style.background = "transparent"}
+                    onMouseOver={e => !loading && (e.currentTarget.style.background = "rgba(102, 126, 234, 0.2)")}
+                    onMouseOut={e => !loading && (e.currentTarget.style.background = "rgba(102, 126, 234, 0.1)")}
                 >
-                    <span style={{ color: "#A0AEC0", transform: "rotate(180deg)", display: "inline-block", fontSize: "1.1rem" }}>↪</span>
-                    <span style={{ fontSize: "0.85rem", color: "#CBD5E0", lineHeight: 1.5 }}>{q}</span>
-                </div>
+                    <span style={{ fontSize: "0.9rem" }}>✨</span>
+                    <span>{q}</span>
+                </button>
             ))}
             
             {questions.length > 3 && (
                 <button 
                     onClick={() => setShowAll(!showAll)}
                     style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
                         background: "none",
                         border: "none",
                         color: "#718096",
-                        fontSize: "0.8rem",
-                        padding: "8px 12px",
+                        fontSize: "0.75rem",
                         cursor: "pointer",
-                        marginTop: "4px"
+                        padding: "4px 8px",
+                        borderRadius: "4px",
+                        transition: "color 0.2s"
                     }}
+                    onMouseOver={e => e.currentTarget.style.color = "#A0AEC0"}
+                    onMouseOut={e => e.currentTarget.style.color = "#718096"}
                 >
-                    <span style={{ fontSize: "1.1rem" }}>{showAll ? "≡" : "⋮"}</span>
-                    <span>{showAll ? "Show fewer suggestions" : `Show ${questions.length - 3} more suggestions`}</span>
+                    {showAll ? "Show less" : `+${questions.length - 3} more suggestions`}
                 </button>
             )}
         </div>
@@ -136,7 +145,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                 content: response.answer,
                 sources: response.sources,
                 intent: response.intent,
-                type: response.type, // Store the document type
+                type: response.type,
             }]);
         } catch (err) {
             const detail = err?.response?.data?.detail || err.message || "Something went wrong.";
@@ -174,21 +183,29 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         }
     };
 
-    // Helper to format suggested follow-up questions or summary sections
     const renderAssistantContent = (msg) => {
         const isLegal = msg.type === "legal_case";
-        const content = msg.content || "";
+        const rawContent = msg.content || "";
         
-        // Split summary from questions if present
-        const parts = content.split("### Suggested Questions");
-        const summary = parts[0];
-        const questionsRaw = parts[1] || "";
-        
-        // Parse questions into an array
-        const questionsList = questionsRaw
-            .split(/\n/)
-            .map(q => q.replace(/^[-1-9.\s]+/, "").trim())
-            .filter(q => q.length > 5);
+        let summary = rawContent;
+        let questionsList = [];
+
+        // Attempt JSON parsing first (Requirement 1)
+        try {
+            const data = JSON.parse(rawContent);
+            summary = data.summary || rawContent;
+            questionsList = data.suggested_questions || [];
+        } catch (err) {
+            // Fallback to legacy regex parsing (Requirement 4 robustness)
+            const parts = rawContent.split("### Suggested Questions");
+            summary = parts[0];
+            const questionsRaw = parts[1] || "";
+            
+            questionsList = questionsRaw
+                .split(/\n/)
+                .map(q => q.replace(/^[-1-9.\s]+/, "").trim())
+                .filter(q => q.length > 5);
+        }
 
         return (
             <>
@@ -224,6 +241,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                 <AssistantSuggestions 
                     questions={questionsList} 
                     onQuery={(q) => handleSend(q)} 
+                    loading={loading}
                 />
             </>
         );
