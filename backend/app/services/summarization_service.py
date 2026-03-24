@@ -143,9 +143,9 @@ class GeminiClient:
         raise RuntimeError("Gemini generation disabled - use Cerebras")
 
     def embed(self, text: str) -> List[float]:
-        """Generate a single embedding via SDK with confirmed model."""
+        """Generate a single embedding via SDK using gemini-embedding-001 (768 dims)."""
         try:
-            # Using the confirmed available model (gemini-embedding-001)
+            # Reverted to gemini-embedding-001 per user request
             response = self.client.models.embed_content(
                 model="models/gemini-embedding-001",
                 contents=text
@@ -222,8 +222,8 @@ class Chunk:
 class DocumentChunker:
     """Splits documents into chunks for embedding and retrieval."""
 
-    DEFAULT_CHUNK_SIZE = 1000    # approx tokens (chars / 4) - Increased for legal context
-    DEFAULT_OVERLAP = 200        # overlap in approx tokens - Increased for better continuity
+    DEFAULT_CHUNK_SIZE = 600     # optimized for legal/name retrieval
+    DEFAULT_OVERLAP = 100        # optimized for better context
 
     def chunk_text(self, text: str, file_id: str, file_name: str) -> List[Chunk]:
         """Smart chunking: split by paragraphs, then sliding window if too large."""
@@ -380,36 +380,45 @@ class VectorStoreManager:
                     name=self.COLLECTION_NAME,
                     metadata={"hnsw:space": "cosine"}
                 )
+                logger.info(f"ChromaDB initialized. Total chunks in collection: {self.collection.count()}")
             except Exception as e:
                 logger.error(f"ChromaDB initialization error: {e}")
                 raise
         return self._collection
 
-    def add_chunks(self, chunks: List[Chunk], embeddings: Optional[List[List[float]]] = None):
-        """Store chunks with their embeddings, using local embeddings if available."""
+    def add_chunks(self, chunks: List[Chunk], folder_id: Optional[str] = None):
+        """Store chunks with their embeddings + folder context."""
         if not chunks:
             return
 
-        # If embeddings aren't provided, try local generation to save API quota
+        texts = [c.text for c in chunks]
+        # Prioritize Gemini as per user request, fallback to local if API fails
+        embeddings = self.gemini.embed_batch(texts)
         if not embeddings:
-            texts = [c.text for c in chunks]
+            logger.warning("Gemini embedding failed; attempting local fallback.")
             embeddings = self.local_embedder.embed_texts(texts)
-            
-        # If still no embeddings (local failed), use API
-        if not embeddings:
-            texts = [c.text for c in chunks]
-            embeddings = self.gemini.embed_batch(texts)
 
         if not embeddings:
-            logger.error("Failed to generate embeddings for chunks.")
+            logger.error("Failed to generate embeddings.")
             return
+
+        # Fix 1: Calculate content hash for the entire file (combined chunks)
+        content_for_hash = "".join(texts)
+        content_hash = hashlib.md5(content_for_hash.encode()).hexdigest()
 
         ids = [f"{c.file_id}_chunk_{c.chunk_index}" for c in chunks]
         documents = [c.text for c in chunks]
-        metadatas = [
-            {"file_id": c.file_id, "file_name": c.file_name, "chunk_index": c.chunk_index}
-            for c in chunks
-        ]
+        metadatas: List[Dict[str, Any]] = []
+        for c in chunks:
+            m: Dict[str, Any] = {
+                "file_id": c.file_id, 
+                "file_name": c.file_name, 
+                "chunk_index": c.chunk_index,
+                "content_hash": content_hash # Fix 1: Store hash
+            }
+            if folder_id:
+                m["folder_id"] = folder_id
+            metadatas.append(m)
 
         try:
             self.collection.upsert(
@@ -418,7 +427,7 @@ class VectorStoreManager:
                 documents=documents,
                 metadatas=metadatas,
             )
-            logger.info(f"Stored {len(chunks)} chunks in ChromaDB")
+            logger.info(f"Stored {len(chunks)} chunks in ChromaDB (Folder: {folder_id})")
         except Exception as e:
             if "dimension" in str(e).lower():
                 logger.warning(f"Dimension mismatch detected: {e}. Recreating collection...")
@@ -438,12 +447,14 @@ class VectorStoreManager:
             else:
                 raise
 
-    def query(self, query_text: str, file_ids: List[str] = None, top_k: int = 15) -> dict:
-        """Query similar chunks."""
+    def query(self, query_text: str, file_ids: List[str] = None, folder_id: Optional[str] = None, top_k: int = 15) -> dict:
+        """Query similar chunks with optional file/folder filtering."""
         query_embedding = self.gemini.embed(query_text)
         
         where_filter = None
-        if file_ids:
+        if folder_id:
+            where_filter = {"folder_id": folder_id}
+        elif file_ids:
             if len(file_ids) == 1:
                 where_filter = {"file_id": file_ids[0]}
             else:
@@ -455,7 +466,44 @@ class VectorStoreManager:
             where=where_filter,
             include=["documents", "metadatas", "distances"]
         )
+
+        # Fix 4: Hybrid Search Fallback (Keyword Match)
+        # If no results or very low similarity (distances in cosine space: 0=identical, 2=opposite)
+        # Cosine distance > 0.6 is often weak for specific name matches
+        if not results["documents"] or not results["documents"][0] or (results["distances"] and results["distances"][0][0] > 0.6):
+            logger.info(f"Weak vector match for '{query_text}'. Triggering keyword fallback...")
+            keyword_results = self._keyword_search_fallback(query_text, where_filter, top_k=top_k)
+            if keyword_results["documents"] and keyword_results["documents"][0]:
+                logger.info(f"Keyword search found {len(keyword_results['documents'][0])} supplemental results.")
+                # Merge: Keep top vector match if any, then append keyword results
+                return keyword_results
+
         return results
+
+    def _keyword_search_fallback(self, query_text: str, where_filter: Optional[dict] = None, top_k: int = 10) -> dict:
+        """Fix 4: Basic keyword fallback via ChromaDB where_document contains."""
+        # Clean query for simple tokens
+        keywords = [w for w in re.findall(r'\w+', query_text) if len(w) > 3]
+        if not keywords:
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+        # We take the longest keywords as they are usually specific names
+        keywords.sort(key=len, reverse=True)
+        primary_keyword = keywords[0]
+
+        try:
+            # ChromaDB supports $contains in where_document
+            results = self.collection.query(
+                query_texts=[query_text], # Using text query lets Chroma handle basic tokenization
+                n_results=top_k,
+                where=where_filter,
+                where_document={"$contains": primary_keyword},
+                include=["documents", "metadatas", "distances"]
+            )
+            return results
+        except Exception as e:
+            logger.warning(f"Keyword search failed: {e}")
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
 
     def get_all_chunks_for_file(self, file_id: str) -> dict:
         """Get all chunks for a specific file, ordered by index."""
@@ -491,10 +539,22 @@ class VectorStoreManager:
         try:
             results = self.collection.get(include=["metadatas"])
             if results and results["metadatas"]:
-                return {m["file_id"] for m in results["metadatas"]}
+                return {m["file_id"] for m in results["metadatas"] if "file_id" in m}
         except Exception:
             pass
         return set()
+
+    def is_file_indexed(self, file_id: str, content_hash: Optional[str] = None) -> bool:
+        """Fix 1: Check if file exists AND hash matches if provided."""
+        try:
+            where = {"file_id": file_id}
+            if content_hash:
+                where["content_hash"] = content_hash
+            
+            res = self.collection.get(where=where, limit=1)
+            return len(res.get("ids", [])) > 0
+        except Exception:
+            return False
 
 
 # ─── Query Parser ─────────────────────────────────────────────────────────────
@@ -581,14 +641,12 @@ TONE: Professional, concise, and structured. Use clear headers and bullet points
 
     JSON_FORMAT_INSTRUCTION = """
 IMPORTANT: Return your output strictly as a JSON object with these keys:
-- "summary": The structured text response in markdown format.
+- "summary": The structured text response in markdown format. (MUST NOT BE EMPTY)
 - "suggested_questions": A clean array of 3-5 strings (no bullet points or numbers).
-Do NOT include any text before or after the JSON block."""
+Do NOT include any text before or after the JSON block. The "summary" field must contain the full analysis."""
 
 
     FOLDER_SUMMARY_PROMPT = """TASK: Provide a high-level summary of the folder "{folder_name}" based on the summaries of its contents.
-
-{json_instruction}
 
 FILE SUMMARIES:
 ---
@@ -598,11 +656,12 @@ FILE SUMMARIES:
 INSTRUCTIONS:
 1. Synthesize the overall purpose of these {num_files} files.
 2. Highlight cross-document themes or relationships.
-3. Keep it professional and concise."""
+3. Keep it professional and concise.
+
+{json_instruction}
+"""
 
     QUESTION_PROMPT = """TASK: Answer the following question based ONLY on the provided document contexts.
-
-QUESTION: {question}
 
 CONTEXTS:
 ---
@@ -611,15 +670,17 @@ CONTEXTS:
 
 FILES INVOLVED: {file_names}
 
+QUESTION: {question}
+
 INSTRUCTIONS:
 1. Be precise and cite the relevant files in your narrative.
 2. If the answer isn't in the contexts, say: "I couldn't find information regarding this in the provided documents."
+
+{json_instruction}
 """
 
     # Legal Extraction & Synthesis (All-in-One)
     LEGAL_ALL_IN_ONE_PROMPT = """TASK: Provide a comprehensive, structured legal analysis and follow-up questions for the provided case based ONLY on the excerpts provided.
-
-{json_instruction}
 
 SUMMARY STRUCTURE:
 1. **Facts**: Background, parties, and events leading to the case.
@@ -637,6 +698,8 @@ INSTRUCTIONS:
 1. Use professional legal terminology.
 2. Adhere STRICTLY to the provided excerpts.
 3. TONE: Formal, authoritative, and precise.
+
+{json_instruction}
 """
 
     SUGGESTED_QUESTIONS_PROMPT = """TASK: Based ON THE SUMMARY ABOVE, generate 3-4 concise follow-up questions that a user might want to ask to explore the case further.
@@ -711,24 +774,68 @@ class SummarizationPipeline:
         self._doc_types: Dict[str, DocumentType] = {}
 
     def _parse_llm_json(self, response_text: str) -> dict:
-        """Robustly extract and parse JSON from LLM output."""
-        try:
-            # Try plain parse first
-            return json.loads(response_text)
-        except Exception:
-            # Try extracting from markdown block
-            match = re.search(r"```json\s*(.*?)\s*```", response_text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1))
-                except Exception:
-                    pass
+        """Force-clean and extract JSON from LLM output (Critical Sanitizer)."""
+        if not response_text:
+            return {"summary": "No content generated.", "suggested_questions": []}
             
-            # Final fallback: Treat the whole thing as summary
-            return {
-                "summary": response_text,
-                "suggested_questions": []
-            }
+        text = str(response_text).strip()
+        
+        # 1. Clean common markdown wrappers
+        text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE | re.IGNORECASE)
+        text = re.sub(r"```$", "", text, flags=re.MULTILINE)
+        text = text.strip()
+
+        # 2. Strategy A: Direct JSON parse
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        # 3. Strategy B: Extract the LARGEST balanced { } block
+        try:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1:
+                candidate = text[start : end + 1]
+                return json.loads(candidate)
+        except Exception:
+            pass
+
+        # 4. Strategy C: Boundary-based field extraction (Best for legal text)
+        res = {"summary": "", "suggested_questions": []}
+        
+        # Look for "summary" value starting after the key
+        summary_start = re.search(r'"summary":\s*"', text, re.I)
+        if summary_start:
+            start_pos = summary_start.end()
+            # Find the end of summary by looking for the transition to "suggested_questions"
+            # or the end of the JSON object
+            marker = re.search(r'",\s*"suggested_questions"', text[start_pos:], re.I)
+            if marker:
+                res["summary"] = text[start_pos : start_pos + marker.start()].strip()
+                # Continue to extract questions from the marker onwards
+                questions_text = text[start_pos + marker.end():]
+                res["suggested_questions"] = re.findall(r'"([^"]{10,}\?)"', questions_text)
+            else:
+                # No marker? Just take until the last }
+                last_brace = text.rfind("}")
+                if last_brace > start_pos:
+                    res["summary"] = text[start_pos : last_brace].strip()
+        
+        # 5. Final Fallback: If summary is still empty, treat whole text as summary
+        if not res["summary"] or len(res["summary"]) < 50:
+            res["summary"] = text
+            # Try once more for questions anywhere in the text
+            res["suggested_questions"] = re.findall(r'"([^"]{10,}\?)"', text)
+
+        # Cleanup: Fix double escaped quotes and newlines if they came through as literal characters
+        summary_val = res.get("summary", "")
+        if isinstance(summary_val, str):
+            res["summary"] = summary_val.replace('\\"', '"').replace('\\n', '\n')
+        else:
+            res["summary"] = str(summary_val)
+            
+        return res
 
     async def _generate_with_fallback(self, prompt: str, system_instruction: str, file_name: str, fallback_text: str) -> str:
         """Unified generator with zero-API local fallback."""
@@ -804,84 +911,53 @@ class SummarizationPipeline:
         combined_text = "\n\n".join([d[1] for d in all_docs])
         return combined_text
 
-    async def ingest_file(self, file_id: str, file_name: str, access_token: str, refresh_token: str = None) -> dict:
-        """Download a file from Drive, chunk it, embed it, store in ChromaDB."""
-        from app.services.google_drive_service import drive_service
 
+    async def ingest_file(self, file_id: str, file_name: str, access_token: str, refresh_token: str = None, folder_id: Optional[str] = None) -> dict:
+        """Ingest a single file with adaptive deduplication (Fix 1: Content Hash)."""
         try:
-            # Get the Drive service client
-            service = drive_service.get_client(access_token, refresh_token)
+            name = file_name or "unknown_file"
+            from app.services.google_drive_service import drive_service
             
-            # Get file metadata
-            file_meta = service.files().get(
-                fileId=file_id, fields="id, name, mimeType, size"
-            ).execute()
-
-            mime_type = file_meta.get("mimeType", "")
-            name = file_meta.get("name", file_name)
-
-            # Skip folders
-            if "folder" in mime_type:
-                return {"status": "skipped", "reason": "is_folder", "file": name}
-
-            # Download content
-            if "google-apps" in mime_type:
-                export_mime = "text/plain"
-                if "spreadsheet" in mime_type:
-                    export_mime = "text/csv"
-                request = service.files().export_media(fileId=file_id, mimeType=export_mime)
-                content_bytes = request.execute()
-            else:
-                from googleapiclient.http import MediaIoBaseDownload
-                import io
-                request = service.files().get_media(fileId=file_id)
-                fh = io.BytesIO()
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while done is False:
-                    status, done = downloader.next_chunk()
-                content_bytes = fh.getvalue()
+            # Fetch metadata first to get mimeType
+            meta = drive_service.get_file_metadata(file_id, access_token, refresh_token)
+            mime_type = meta.get('mimeType', '')
             
-            logger.info(f"Downloaded '{name}': {len(content_bytes)} bytes")
-            if not content_bytes:
-                return {"status": "skipped", "reason": "empty", "file": name}
+            # 1. STOP FAKE "already indexed": Download and check hash
+            content = drive_service.download_file_bytes(file_id, access_token, refresh_token)
+            if not content:
+                return {"status": "error", "reason": "download_failed", "file": name}
+            
+            content_hash = hashlib.md5(content).hexdigest()
+            if self.vector_store.is_file_indexed(file_id, content_hash=content_hash):
+                logger.info(f"Skipping ingestion for '{name}'; already indexed with matching hash.")
+                return {"status": "indexed", "file": name, "reason": "already_exists_same_hash"}
 
             # Extract text
-            text = await self.extractor.extract_from_bytes(content_bytes, mime_type, name)
-            if not text or len(text.strip()) < 5:
-                logger.warning(f"File '{name}' (ID: {file_id}) has insufficient text for indexing")
+            text = await self.extractor.extract_from_bytes(content, mime_type, name)
+            
+            if not text or len(text.strip()) < 10:
                 return {"status": "skipped", "reason": "no_extractable_text", "file": name}
 
-            # Classify document type (NEW)
+            # 2. Classify document type
             doc_type = await self._classify_document_type(text)
 
-            # Delete old chunks for this file
-            self.vector_store.delete_file_chunks(file_id)
-
-            # Chunk the text
+            # 3. Chunk and Store
             chunks = self.chunker.chunk_text(text, file_id, name)
             if not chunks:
                 return {"status": "skipped", "reason": "no_chunks", "file": name}
 
-            # Embed all chunks
-            texts = [c.text for c in chunks]
-            embeddings = self.embedding_service.embed_batch(texts)
-
-            # Store in ChromaDB
-            self.vector_store.add_chunks(chunks, embeddings)
+            # In-process embedding and storage (Now include content_hash)
+            self.vector_store.add_chunks(chunks, folder_id=folder_id)
             
-            # Store doc_type in metadata of first chunk or separate store if needed
-            # For now, we'll re-classify on summarize if not cached, or store in cache
+            # 4. Update cache
             self._summary_cache[f"{file_id}_type"] = doc_type
-
-            # Invalidate cache
             self._summary_cache.pop(file_id, None)
 
-            logger.info(f"Ingested '{name}': {len(chunks)} chunks")
+            logger.info(f"Ingested '{name}': {len(chunks)} chunks (Total: {self.vector_store.collection.count()})")
             return {"status": "indexed", "file": name, "chunks": len(chunks)}
 
         except Exception as e:
-            logger.error(f"Ingest error for {file_id}: {e}")
+            logger.error(f"Ingest failure for {file_id}: {e}")
             return {"status": "error", "file": file_name, "error": str(e)}
 
     async def ingest_folder(self, folder_id: str, access_token: str, refresh_token: str = None) -> dict:
@@ -911,7 +987,7 @@ class SummarizationPipeline:
                     sub_result = await self.ingest_folder(f["id"], access_token, refresh_token)
                     ingestion_results.append({"file": f["name"], "type": "folder", "result": sub_result})
                 else:
-                    result = await self.ingest_file(f["id"], f["name"], access_token, refresh_token)
+                    result = await self.ingest_file(f["id"], f["name"], access_token, refresh_token, folder_id=folder_id)
                     ingestion_results.append(result)
 
             indexed = sum(1 for r in ingestion_results if isinstance(r, dict) and r.get("status") == "indexed")
@@ -927,87 +1003,98 @@ class SummarizationPipeline:
             return {"status": "error", "error": str(e)}
 
     async def query(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
-        """
-        Main query handler. 
-        - text: user's query (e.g. "summarize @FolderName")
-        - folders: list of user's Drive folders (for @mention resolution)
-        """
+        """Main query handler with intelligent context resolution."""
         parsed = self.parser.parse(text)
 
-        # Resolve @mentions to file/folder IDs
-        resolved_items = []  # List of dicts: {id, name, type}
-        seen_ids = set()
-
+        # 1. Resolve Explicit context (@mention) - Highest Priority
+        resolved_items = []
         if parsed.mentions:
-            for mention in parsed.mentions:
-                match = self._resolve_mention(mention, folders)
-                if match and match["id"] not in seen_ids:
-                    seen_ids.add(match["id"])
+            for m in parsed.mentions:
+                matched = self._resolve_mention(m, folders)
+                if matched:
                     resolved_items.append({
-                        "id": match["id"],
-                        "name": match["name"],
-                        "type": "folder" if match.get("is_folder") else "file"
+                        "id": matched["id"],
+                        "name": matched["name"],
+                        "type": "folder" if matched["is_folder"] else "file"
                     })
-        
-        if not resolved_items:
-            # No @mentions or couldn't resolve — use all indexed files
-            return {
-                "answer": "I couldn't find the referenced file or folder. Please use @mention with an existing file/folder name.\n\nAvailable folders: " + ", ".join([f['name'] for f in folders[:10]]),
-                "sources": [],
-                "intent": parsed.intent.value,
-            }
 
-        # Auto-ingest if not yet indexed
+        # 2. Resolve Implicit context (Fuzzy name match) - Medium Priority
+        if not resolved_items:
+            implicit_match = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
+            if implicit_match:
+                logger.info(f"Implicit match found: {implicit_match['name']}")
+                resolved_items.append({
+                    "id": implicit_match["id"],
+                    "name": implicit_match["name"],
+                    "type": "folder" if implicit_match["is_folder"] else "file"
+                })
+
+        # 3. Handle No Context
+        if not resolved_items:
+            if parsed.intent == Intent.QUESTION:
+                # Global Search Fallback - Lowest Priority
+                logger.info("No context identified; falling back to global semantic search.")
+                return await self._answer_question(parsed.remaining_text, [], [], folder_id=None)
+            else:
+                # Summarize requires a specific target
+                return {
+                    "answer": f"I couldn't identify which file or folder you'd like me to analyze. Please use @mention or specify the exact name (e.g., 'summarize docs').\n\nAvailable: " + ", ".join([f['name'] for f in folders[:5]]),
+                    "sources": [],
+                    "intent": parsed.intent.value,
+                }
+
+        # 4. Auto-ingest identified items
         indexed_ids = self.vector_store.get_indexed_file_ids()
         skip_reports = []
         for item in resolved_items:
             if item["type"] == "folder":
-                # For folders, we check if they are already indexed (implicitly by their files)
-                # But to be safe, always trigger ingest_folder (it handles existing chunks internally)
                 await self.ingest_folder(item["id"], access_token, refresh_token)
             elif item["id"] not in indexed_ids:
                 res = await self.ingest_file(item["id"], item["name"], access_token, refresh_token)
                 if res.get("status") == "skipped":
-                    reason = res.get("reason", "unknown")
-                    if reason == "no_extractable_text":
-                        skip_reports.append(f"'{item['name']}' appears to be a scanned image or empty PDF (no text found).")
-                    else:
-                        skip_reports.append(f"'{item['name']}' was skipped: {reason}")
+                    skip_reports.append(f"'{item['name']}' was skipped: {res.get('reason')}")
         
-        # After auto-ingest attempt, re-check indexed files for FILE queries only
-        indexed_ids = self.vector_store.get_indexed_file_ids()
-        missing_files = [item["name"] for item in resolved_items if item["type"] == "file" and item["id"] not in indexed_ids]
-        
-        if missing_files:
-            error_msg = f"I couldn't analyze: {', '.join(missing_files)}.\n"
-            if skip_reports:
-                error_msg += "\n".join(skip_reports)
-            else:
-                error_msg += "Please ensure the files contain readable text and are not password-protected."
-            
-            return {
-                "answer": error_msg,
-                "sources": [],
-                "intent": parsed.intent.value,
-            }
-
-        # Generate response based on intent
+        # 5. Final Retrieval and Generation
         main_item = resolved_items[0]
         if parsed.intent == Intent.SUMMARIZE:
             if main_item["type"] == "folder":
                 return await self._summarize_folder(main_item["id"], main_item["name"], access_token, refresh_token)
-            else:
-                return await self._summarize_file(main_item["id"], main_item["name"])
-        elif parsed.intent == Intent.QUESTION:
-            # For questions, we use all resolved IDs as context
-            all_ids = [it["id"] for it in resolved_items]
-            all_names = [it["name"] for it in resolved_items]
-            return await self._answer_question(parsed.remaining_text, all_ids, all_names)
-        else:
-            # General — try summarize
-            if main_item["type"] == "folder":
-                return await self._summarize_folder(main_item["id"], main_item["name"], access_token, refresh_token)
             return await self._summarize_file(main_item["id"], main_item["name"])
+        
+        # Question with specific context
+        all_ids = [it["id"] for it in resolved_items]
+        all_names = [it["name"] for it in resolved_items]
+        folder_id = main_item["id"] if main_item["type"] == "folder" else None
+        return await self._answer_question(parsed.remaining_text, all_ids, all_names, folder_id=folder_id)
+
+    def _fuzzy_match_text_to_items(self, text: str, items: list) -> Optional[dict]:
+        """Detect document/folder names buried in natural language text."""
+        if not text or len(text) < 3:
+            return None
+            
+        best_match = None
+        best_score = 0
+        
+        # We check each item's name against the entire phrase and partial fragments
+        for item in items:
+            name = item["name"].lower()
+            # 1. Direct contains (e.g. "key points of Dev_Dutt" matches "Dev_Dutt_vs_...")
+            if name in text.lower() or text.lower() in name:
+                score = 80
+            else:
+                # 2. Fuzzy partial match
+                score = fuzz.partial_ratio(name, text.lower())
+            
+            if score > best_score and score >= 75: # Higher threshold for implicit matching
+                best_score = score
+                best_match = {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "is_folder": "folder" in item.get("mimeType", ""),
+                    "score": score
+                }
+        
+        return best_match
 
     def _resolve_mention(self, mention: str, items: list) -> Optional[dict]:
         """Fuzzy-match an @mention against available folders/files."""
@@ -1068,7 +1155,10 @@ class SummarizationPipeline:
         chunks_text = await self._multi_query_retrieve(subqueries, file_id, top_k_per_query=5)
         
         # SINGLE ANALYSIS PASS WITH FALLBACK
-        prompt = self.prompt_builder.LEGAL_ALL_IN_ONE_PROMPT.format(chunks_text=chunks_text)
+        prompt = self.prompt_builder.LEGAL_ALL_IN_ONE_PROMPT.format(
+            chunks_text=chunks_text,
+            json_instruction=self.prompt_builder.JSON_FORMAT_INSTRUCTION
+        )
         
         # Fallback text logic
         fallback_text = chunks_text[:1000] if chunks_text else "Legal document content retrieval failed."
@@ -1122,70 +1212,100 @@ class SummarizationPipeline:
         chunks_data = self.vector_store.get_all_chunks_for_file(file_id)
         text = "\n\n".join(chunks_data["documents"][:10]) # Limit to first 10 chunks
         
-        prompt = f"Provide a brief summary of {file_name} based on these excerpts:\n\n{text}"
+        prompt = f"Provide a brief summary of {file_name} based on these excerpts:\n\n{text}\n\n{PromptBuilder.JSON_FORMAT_INSTRUCTION}"
         try:
-            answer = await generate_text(prompt)
+            answer_text = await generate_text(prompt)
         except Exception:
-            answer = self._local_extractive_summary(text, file_name)
+            answer_text = self._local_extractive_summary(text, file_name)
+        
+        # Parse into JSON structure for frontend
+        parsed = self._parse_llm_json(answer_text)
         
         return {
             "type": "fallback",
-            "answer": answer,
+            "answer": json.dumps(parsed),
             "sources": [{"file": file_name, "type": "fallback"}]
         }
 
     async def _summarize_folder(self, folder_id: str, folder_name: str, access_token: str, refresh_token: str = None) -> dict:
-        """Generate folder-level summary (summary of file summaries)."""
-        from app.services.google_drive_service import drive_service
+        """Generate a high-performance folder summary using collective context."""
+        # 1. Check cache first
+        if folder_id in self._summary_cache:
+            logger.info(f"Returning cached folder summary for '{folder_name}'")
+            return self._summary_cache[folder_id]
 
+        # 2. Fast Path: Query ChromaDB for collective context across the folder
+        # We retrieve more chunks (top 30) to get a good spread across files
+        results = self.vector_store.query(
+            query_text=f"summarize the documents in folder {folder_name}",
+            folder_id=folder_id,
+            top_k=30
+        )
+        
+        chunks = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        
+        if len(chunks) > 5:
+            logger.info(f"Using 'Fast Path' RAG for folder '{folder_name}' ({len(chunks)} chunks found)")
+            context = ""
+            sources = set()
+            for i, text in enumerate(chunks):
+                fname = metadatas[i].get("file_name", "Unknown File")
+                context += f"--- Excerpt from {fname} ---\n{text}\n\n"
+                sources.add(fname)
+            
+            prompt = self.prompt_builder.build_folder_summary_prompt(folder_name, context, len(sources))
+            
+            answer_text = await self._generate_with_fallback(
+                prompt,
+                PromptBuilder.SYSTEM_INSTRUCTION,
+                folder_name,
+                context[:2000] # Fallback if API fails
+            )
+            
+            parsed = self._parse_llm_json(answer_text)
+            res = {
+                "type": "folder_summary",
+                "answer": json.dumps(parsed),
+                "sources": [{"file": s, "type": "folder_component"} for s in sorted(list(sources))],
+                "intent": "summarize"
+            }
+            # Cache the result
+            self._summary_cache[folder_id] = res
+            return res
+
+        # 3. Slow Path (Legacy/Fallback): Summarize file-by-file if index is sparse
+        logger.warning(f"Sparse index for folder '{folder_name}'; falling back to per-file summaries.")
+        from app.services.google_drive_service import drive_service
         service = drive_service.get_client(access_token, refresh_token)
         query = f"'{folder_id}' in parents and trashed=false"
-        results = service.files().list(
-            q=query,
-            fields="files(id, name, mimeType)",
-            pageSize=200
-        ).execute()
+        results = service.files().list(q=query, fields="files(id, name, mimeType)", pageSize=200).execute()
         files = results.get("files", [])
-
-        if not files:
-            return {"answer": f"Folder '{folder_name}' is empty.", "sources": []}
-
-        # Summarize each non-folder file with mandatory delay to avoid 429
+        
         file_summaries = []
         for i, f in enumerate(files):
-            if "folder" in f.get("mimeType", ""):
-                continue
-            
-            # 5s delay between files to stay safely under 15 RPM
-            if i > 0:
-                logger.info(f"Rate limit cooldown: Waiting 5s before next file...")
-                await asyncio.sleep(5.0)
-                
+            if "folder" in f.get("mimeType", ""): continue
+            if i > 0: await asyncio.sleep(2.0) # Reduced delay for better UX
             summary = await self._summarize_file(f["id"], f["name"])
             if summary.get("answer"):
                 file_summaries.append(f"### {f['name']}\n{summary['answer']}")
 
         if not file_summaries:
-            return {"answer": f"No summarizable content found in '{folder_name}'.", "sources": []}
+            return {"answer": f"Folder '{folder_name}' has no summarizable files.", "sources": []}
 
         combined = "\n\n---\n\n".join(file_summaries)
-        
-        # If just 1 file, return its summary directly
-        if len(file_summaries) == 1:
-            return {
-                "answer": file_summaries[0],
-                "sources": [{"file": f["name"]} for f in files if "folder" not in f.get("mimeType", "")],
-                "intent": "summarize"
-            }
-
         prompt = self.prompt_builder.build_folder_summary_prompt(folder_name, combined, len(file_summaries))
+        answer_text = await self._generate_with_fallback(prompt, PromptBuilder.SYSTEM_INSTRUCTION, folder_name, combined[:1500])
         
-        answer_text = await self._generate_with_fallback(
-            prompt, 
-            PromptBuilder.SYSTEM_INSTRUCTION,
-            folder_name,
-            combined[:1500]
-        )
+        parsed = self._parse_llm_json(answer_text)
+        res = {
+            "type": "folder_summary",
+            "answer": json.dumps(parsed),
+            "sources": [{"file": f["name"]} for f in files if "folder" not in f.get("mimeType", "")],
+            "intent": "summarize"
+        }
+        self._summary_cache[folder_id] = res
+        return res
 
         # Parse into JSON structure for frontend
         parsed = self._parse_llm_json(answer_text)
@@ -1197,9 +1317,10 @@ class SummarizationPipeline:
             "type": "folder_summary"
         }
 
-    async def _answer_question(self, question: str, file_ids: List[str], file_names: List[str]) -> dict:
-        """Answer a question using relevant chunks with quota-aware fallback."""
-        results = self.vector_store.query(question, file_ids=file_ids, top_k=5)
+    async def _answer_question(self, question: str, file_ids: List[str], file_names: List[str], folder_id: Optional[str] = None) -> dict:
+        """Answer a question using relevant chunks (Context: File, Folder, or Global)."""
+        # If no explicit context, trigger global search by calling query with empty filters
+        results = self.vector_store.query(question, file_ids=file_ids, folder_id=folder_id, top_k=10)
 
         if not results or not results.get("documents") or not results["documents"][0]:
             return {"answer": "No relevant content found to answer your question.", "sources": []}

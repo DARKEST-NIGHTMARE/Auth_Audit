@@ -1,66 +1,117 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { summarizationApi } from "../../services/summarizationApi";
 
-const AssistantSuggestions = ({ questions, onQuery, loading }) => {
+const AssistantSuggestions = ({ questions, onQuery, loading, contextFile }) => {
     const [showAll, setShowAll] = useState(false);
+    
+    useEffect(() => {
+        const styleId = "gemini-suggestions-style";
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement("style");
+            style.id = styleId;
+            style.innerHTML = `
+                .gemini-suggestion {
+                    background-color: transparent !important;
+                    transition: all 0.2s ease !important;
+                    border: none !important;
+                    outline: none !important;
+                }
+                .gemini-suggestion:hover:not(:disabled) {
+                    background-color: rgba(255, 255, 255, 0.08) !important;
+                }
+                .gemini-suggestion:active:not(:disabled) {
+                    background-color: rgba(255, 255, 255, 0.15) !important;
+                    transform: scale(0.98);
+                }
+                .gemini-suggestion-toggle:hover {
+                    background-color: rgba(255, 255, 255, 0.05) !important;
+                    color: #E2E8F0 !important;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+    }, []);
+
     if (!questions || questions.length === 0) return null;
 
     const displayedQuestions = showAll ? questions : questions.slice(0, 3);
 
     return (
         <div style={{ 
-            marginTop: "16px", 
-            paddingTop: "16px",
-            borderTop: "1px solid rgba(255,255,255,0.08)",
+            marginTop: "1.5rem", 
+            marginBottom: "1rem",
             display: "flex",
-            flexWrap: "wrap",
-            gap: "8px"
+            flexDirection: "column",
+            gap: "2px"
         }}>
-            {displayedQuestions.map((q, idx) => (
+            {displayedQuestions.map((q, idx) => {
+                const questionText = typeof q === "string" ? q : (q?.text || q?.question || JSON.stringify(q) || "");
+                return (
                 <button 
                     key={idx} 
-                    onClick={() => !loading && onQuery(q)}
-                    disabled={loading}
-                    style={{ 
-                        background: "rgba(102, 126, 234, 0.1)", 
-                        border: "1px solid rgba(102, 126, 234, 0.3)",
-                        color: "#E2E8F0",
-                        padding: "6px 14px", 
-                        cursor: loading ? "wait" : "pointer",
-                        borderRadius: "20px",
-                        fontSize: "0.8rem",
-                        transition: "all 0.2s ease-in-out",
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
-                        outline: "none",
-                        opacity: loading ? 0.6 : 1
+                    className="gemini-suggestion"
+                    type="button"
+                    onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (!loading && questionText) onQuery(questionText, contextFile);
                     }}
-                    onMouseOver={e => !loading && (e.currentTarget.style.background = "rgba(102, 126, 234, 0.2)")}
-                    onMouseOut={e => !loading && (e.currentTarget.style.background = "rgba(102, 126, 234, 0.1)")}
+                    disabled={loading}
+                    style={{
+                        textAlign: "left",
+                        padding: "10px 12px",
+                        color: "#E2E8F0",
+                        borderRadius: "8px",
+                        cursor: loading ? "wait" : "pointer",
+                        fontSize: "0.9rem",
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: "14px",
+                        width: "100%",
+                        lineHeight: "1.5",
+                        opacity: loading ? 0.6 : 1,
+                        pointerEvents: "auto",
+                        position: "relative",
+                        zIndex: 10
+                    }}
                 >
-                    <span style={{ fontSize: "0.9rem" }}>✨</span>
-                    <span>{q}</span>
+                    <span style={{ 
+                        color: "#94A3B8", 
+                        fontSize: "1.2rem", 
+                        marginTop: "2px",
+                        display: "inline-block",
+                        transform: "scaleX(-1)"
+                    }}>
+                        ↳
+                    </span>
+                    <span style={{ flex: 1 }}>{questionText}</span>
                 </button>
-            ))}
+                );
+            })}
             
             {questions.length > 3 && (
                 <button 
+                    className="gemini-suggestion-toggle"
+                    type="button"
                     onClick={() => setShowAll(!showAll)}
                     style={{
+                        marginTop: "4px",
                         background: "none",
                         border: "none",
-                        color: "#718096",
-                        fontSize: "0.75rem",
+                        color: "#94A3B8",
+                        fontSize: "0.85rem",
                         cursor: "pointer",
-                        padding: "4px 8px",
-                        borderRadius: "4px",
-                        transition: "color 0.2s"
+                        padding: "8px 12px",
+                        borderRadius: "8px",
+                        transition: "all 0.2s",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "fit-content"
                     }}
-                    onMouseOver={e => e.currentTarget.style.color = "#A0AEC0"}
-                    onMouseOut={e => e.currentTarget.style.color = "#718096"}
                 >
-                    {showAll ? "Show less" : `+${questions.length - 3} more suggestions`}
+                    <span style={{ fontSize: "1.1rem" }}>{showAll ? "✨" : "🪄"}</span>
+                    {showAll ? "Show fewer suggestions" : `Show ${questions.length - 3} more suggestions`}
                 </button>
             )}
         </div>
@@ -127,11 +178,18 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         inputRef.current?.focus();
     };
 
-    const handleSend = async (overrideMsg) => {
-        const userMsg = (typeof overrideMsg === "string" ? overrideMsg : input).trim();
+    const handleSend = async (overrideMsg, contextFile = null) => {
+        let userMsg = (typeof overrideMsg === "string" ? overrideMsg : input).trim();
         if (!userMsg || loading) return;
-        
-        setInput("");
+
+        // Auto-inject context for suggestions (Requirement: Click Behavior)
+        if (typeof overrideMsg === "string" && !userMsg.includes("@")) {
+            const targetContext = contextFile || folderName;
+            if (targetContext) {
+                const contextMention = targetContext.includes(" ") ? `@"${targetContext}"` : `@${targetContext}`;
+                userMsg = `${userMsg} ${contextMention}`;
+            }
+        }
         setShowSuggestions(false);
         setSuggestions([]);
         
@@ -190,15 +248,33 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         let summary = rawContent;
         let questionsList = [];
 
-        // Attempt JSON parsing first (Requirement 1)
         try {
-            const data = JSON.parse(rawContent);
-            summary = data.summary || rawContent;
-            questionsList = data.suggested_questions || [];
+            if (typeof rawContent === "object" && rawContent !== null) {
+                summary = rawContent.summary || "";
+                questionsList = rawContent.suggested_questions || [];
+            } else {
+                let jsonStr = rawContent.trim();
+
+                jsonStr = jsonStr.replace(/```json\s?([\s\S]*?)```/g, "$1").trim();
+                
+                if (!jsonStr.startsWith("{")) {
+                    const firstBrace = jsonStr.indexOf("{");
+                    const lastBrace = jsonStr.lastIndexOf("}");
+                    if (firstBrace !== -1 && lastBrace !== -1) {
+                        jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
+                    }
+                }
+
+                const data = JSON.parse(jsonStr);
+                // If summary is empty, show a fallback message rather than the raw JSON string
+                summary = (data.summary && data.summary.trim()) ? data.summary : (data.summary === "" ? "Summary could not be generated." : rawContent);
+                questionsList = data.suggested_questions || [];
+            }
         } catch (err) {
-            // Fallback to legacy regex parsing (Requirement 4 robustness)
-            const parts = rawContent.split("### Suggested Questions");
-            summary = parts[0];
+            console.warn("JSON parse failed, falling back to regex", err);
+            // Fallback 
+            const parts = typeof rawContent === "string" ? rawContent.split("### Suggested Questions") : ["", ""];
+            summary = parts[0] || (typeof rawContent === "string" ? rawContent : "");
             const questionsRaw = parts[1] || "";
             
             questionsList = questionsRaw
@@ -240,8 +316,9 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
 
                 <AssistantSuggestions 
                     questions={questionsList} 
-                    onQuery={(q) => handleSend(q)} 
+                    onQuery={(q, cf) => handleSend(q, cf)} 
                     loading={loading}
+                    contextFile={msg.sources && msg.sources.length > 0 ? msg.sources[0].file : null}
                 />
             </>
         );
@@ -252,7 +329,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
             {/* Header */}
             <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.1)", background: "rgba(102, 126, 234, 0.1)" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                    <span style={{ fontSize: "1.5rem" }}>🤖</span>
+                    <span style={{ fontSize: "1.5rem" }}></span>
                     <div>
                         <h3 style={{ margin: 0, fontSize: "1.1rem", color: "#F7FAFC" }}>AI Document Analyzer</h3>
                         {folderName && (
