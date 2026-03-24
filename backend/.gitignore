@@ -35,3 +35,4 @@ var/
 # Databases (if using SQLite locally)
 *.sqlite3
 *.db
+chroma_data/
