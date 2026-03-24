@@ -222,7 +222,7 @@ class GoogleDriveService:
         """Fetches metadata for a single file/folder."""
         try:
             service = self.get_client(access_token, refresh_token)
-            return service.files().get(fileId=file_id, fields="id, name, mimeType, size").execute()
+            return service.files().get(fileId=file_id, fields="id, name, mimeType, size, modifiedTime").execute()
         except Exception as e:
             logger.error(f"Google Drive Get Metadata Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
