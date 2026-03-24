@@ -1,4 +1,5 @@
 import os
+from typing import List, Optional
 import httplib2
 from fastapi import HTTPException
 from google.oauth2.credentials import Credentials
@@ -86,7 +87,7 @@ class GoogleDriveService:
             logger.error(f"Error in manual Drive code exchange: {e}")
             raise HTTPException(status_code=400, detail=str(e))
 
-    def get_client(self, access_token: str, refresh_token: str = None):
+    def get_client(self, access_token: str, refresh_token: Optional[str] = None):
         creds = Credentials(
             token=access_token,
             refresh_token=refresh_token,
@@ -100,7 +101,7 @@ class GoogleDriveService:
             
         return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-    def list_folders(self, access_token: str, refresh_token: str = None):
+    def list_folders(self, access_token: str, refresh_token: Optional[str] = None):
         try:
             service = self.get_client(access_token, refresh_token)
             results = service.files().list(
@@ -115,7 +116,7 @@ class GoogleDriveService:
             logger.error(f"Google Drive List Folders Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    def list_all_files(self, access_token: str, refresh_token: str = None):
+    def list_all_files(self, access_token: str, refresh_token: Optional[str] = None):
         try:
             service = self.get_client(access_token, refresh_token)
             results = service.files().list(
@@ -130,7 +131,7 @@ class GoogleDriveService:
             logger.error(f"Google Drive List All Files Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    def analyze_folder(self, folder_id: str, access_token: str, refresh_token: str = None):
+    def analyze_folder(self, folder_id: str, access_token: str, refresh_token: Optional[str] = None):
         try:
             service = self.get_client(access_token, refresh_token)
             query = f"'{folder_id}' in parents and trashed=false"
@@ -167,11 +168,11 @@ class GoogleDriveService:
             logger.error(f"Google Drive Analyze Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    def create_folder(self, name: str, access_token: str, refresh_token: str = None, parent_id: str = None):
+    def create_folder(self, name: str, access_token: str, refresh_token: Optional[str] = None, parent_id: Optional[str] = None):
         """Creates a new folder in the user's Drive."""
         try:
             service = self.get_client(access_token, refresh_token)
-            file_metadata = {
+            file_metadata: dict = {
                 'name': name,
                 'mimeType': 'application/vnd.google-apps.folder'
             }
@@ -185,13 +186,13 @@ class GoogleDriveService:
             logger.error(f"Google Drive Create Folder Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    def create_file(self, name: str, content: str, access_token: str, refresh_token: str = None, parent_id: str = None):
+    def create_file(self, name: str, content: str, access_token: str, refresh_token: Optional[str] = None, parent_id: Optional[str] = None):
         """Creates a new text file in the user's Drive."""
         try:
             from googleapiclient.http import MediaInMemoryUpload
             service = self.get_client(access_token, refresh_token)
             
-            file_metadata = {
+            file_metadata: dict = {
                 'name': name,
                 'mimeType': 'text/plain'
             }
@@ -206,7 +207,7 @@ class GoogleDriveService:
             logger.error(f"Google Drive Create File Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    def trash_item(self, file_id: str, access_token: str, refresh_token: str = None):
+    def trash_item(self, file_id: str, access_token: str, refresh_token: Optional[str] = None):
         """Moves a file or folder to the trash."""
         try:
             service = self.get_client(access_token, refresh_token)
@@ -217,14 +218,53 @@ class GoogleDriveService:
             logger.error(f"Google Drive Trash Item Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    def upload_file(self, file_content: bytes, filename: str, mime_type: str, access_token: str, refresh_token: str = None, parent_id: str = None):
+    def get_file_metadata(self, file_id: str, access_token: str, refresh_token: str = None):
+        """Fetches metadata for a single file/folder."""
+        try:
+            service = self.get_client(access_token, refresh_token)
+            return service.files().get(fileId=file_id, fields="id, name, mimeType, size").execute()
+        except Exception as e:
+            logger.error(f"Google Drive Get Metadata Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    def download_file_bytes(self, file_id: str, access_token: str, refresh_token: str = None) -> bytes:
+        """Downloads a file and returns its raw bytes."""
+        try:
+            import io
+            from googleapiclient.http import MediaIoBaseDownload
+            
+            service = self.get_client(access_token, refresh_token)
+            
+            # Special handling for Google Docs (must be exported)
+            meta = self.get_file_metadata(file_id, access_token, refresh_token)
+            mime = meta.get('mimeType', '')
+            
+            if 'google-apps' in mime:
+                # Export Google Docs as PDF or TXT
+                export_mime = 'application/pdf' if 'document' in mime else 'text/plain'
+                request = service.files().export_media(fileId=file_id, mimeType=export_mime)
+            else:
+                request = service.files().get_media(fileId=file_id)
+                
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+            
+            return fh.getvalue()
+        except Exception as e:
+            logger.error(f"Google Drive Download Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    def upload_file(self, file_content: bytes, filename: str, mime_type: str, access_token: str, refresh_token: Optional[str] = None, parent_id: Optional[str] = None):
         """Uploads a file to the user's Drive."""
         try:
             from googleapiclient.http import MediaIoBaseUpload
             import io
             service = self.get_client(access_token, refresh_token)
             
-            file_metadata = {
+            file_metadata: dict = {
                 'name': filename
             }
             if parent_id:

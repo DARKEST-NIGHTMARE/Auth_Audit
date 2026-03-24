@@ -1,57 +1,117 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { summarizationApi } from "../../services/summarizationApi";
 
-const AssistantSuggestions = ({ questions, onQuery }) => {
+const AssistantSuggestions = ({ questions, onQuery, loading, contextFile }) => {
     const [showAll, setShowAll] = useState(false);
+    
+    useEffect(() => {
+        const styleId = "gemini-suggestions-style";
+        if (!document.getElementById(styleId)) {
+            const style = document.createElement("style");
+            style.id = styleId;
+            style.innerHTML = `
+                .gemini-suggestion {
+                    background-color: transparent !important;
+                    transition: all 0.2s ease !important;
+                    border: none !important;
+                    outline: none !important;
+                }
+                .gemini-suggestion:hover:not(:disabled) {
+                    background-color: rgba(255, 255, 255, 0.08) !important;
+                }
+                .gemini-suggestion:active:not(:disabled) {
+                    background-color: rgba(255, 255, 255, 0.15) !important;
+                    transform: scale(0.98);
+                }
+                .gemini-suggestion-toggle:hover {
+                    background-color: rgba(255, 255, 255, 0.05) !important;
+                    color: #E2E8F0 !important;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+    }, []);
+
     if (!questions || questions.length === 0) return null;
 
     const displayedQuestions = showAll ? questions : questions.slice(0, 3);
 
     return (
         <div style={{ 
-            marginTop: "16px", 
-            paddingTop: "16px",
-            borderTop: "1px solid rgba(255,255,255,0.08)"
+            marginTop: "1.5rem", 
+            marginBottom: "1rem",
+            display: "flex",
+            flexDirection: "column",
+            gap: "2px"
         }}>
-            {displayedQuestions.map((q, idx) => (
-                <div 
+            {displayedQuestions.map((q, idx) => {
+                const questionText = typeof q === "string" ? q : (q?.text || q?.question || JSON.stringify(q) || "");
+                return (
+                <button 
                     key={idx} 
-                    onClick={() => onQuery(q)}
-                    style={{ 
-                        display: "flex", 
-                        gap: "12px", 
-                        padding: "8px 12px", 
-                        cursor: "pointer",
-                        borderRadius: "8px",
-                        transition: "background 0.2s",
-                        marginBottom: "4px"
+                    className="gemini-suggestion"
+                    type="button"
+                    onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (!loading && questionText) onQuery(questionText, contextFile);
                     }}
-                    onMouseOver={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
-                    onMouseOut={e => e.currentTarget.style.background = "transparent"}
+                    disabled={loading}
+                    style={{
+                        textAlign: "left",
+                        padding: "10px 12px",
+                        color: "#E2E8F0",
+                        borderRadius: "8px",
+                        cursor: loading ? "wait" : "pointer",
+                        fontSize: "0.9rem",
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: "14px",
+                        width: "100%",
+                        lineHeight: "1.5",
+                        opacity: loading ? 0.6 : 1,
+                        pointerEvents: "auto",
+                        position: "relative",
+                        zIndex: 10
+                    }}
                 >
-                    <span style={{ color: "#A0AEC0", transform: "rotate(180deg)", display: "inline-block", fontSize: "1.1rem" }}>↪</span>
-                    <span style={{ fontSize: "0.85rem", color: "#CBD5E0", lineHeight: 1.5 }}>{q}</span>
-                </div>
-            ))}
+                    <span style={{ 
+                        color: "#94A3B8", 
+                        fontSize: "1.2rem", 
+                        marginTop: "2px",
+                        display: "inline-block",
+                        transform: "scaleX(-1)"
+                    }}>
+                        ↳
+                    </span>
+                    <span style={{ flex: 1 }}>{questionText}</span>
+                </button>
+                );
+            })}
             
             {questions.length > 3 && (
                 <button 
+                    className="gemini-suggestion-toggle"
+                    type="button"
                     onClick={() => setShowAll(!showAll)}
                     style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
+                        marginTop: "4px",
                         background: "none",
                         border: "none",
-                        color: "#718096",
-                        fontSize: "0.8rem",
-                        padding: "8px 12px",
+                        color: "#94A3B8",
+                        fontSize: "0.85rem",
                         cursor: "pointer",
-                        marginTop: "4px"
+                        padding: "8px 12px",
+                        borderRadius: "8px",
+                        transition: "all 0.2s",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "10px",
+                        width: "fit-content"
                     }}
                 >
-                    <span style={{ fontSize: "1.1rem" }}>{showAll ? "≡" : "⋮"}</span>
-                    <span>{showAll ? "Show fewer suggestions" : `Show ${questions.length - 3} more suggestions`}</span>
+                    <span style={{ fontSize: "1.1rem" }}>{showAll ? "✨" : "🪄"}</span>
+                    {showAll ? "Show fewer suggestions" : `Show ${questions.length - 3} more suggestions`}
                 </button>
             )}
         </div>
@@ -118,11 +178,18 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         inputRef.current?.focus();
     };
 
-    const handleSend = async (overrideMsg) => {
-        const userMsg = (typeof overrideMsg === "string" ? overrideMsg : input).trim();
+    const handleSend = async (overrideMsg, contextFile = null) => {
+        let userMsg = (typeof overrideMsg === "string" ? overrideMsg : input).trim();
         if (!userMsg || loading) return;
-        
-        setInput("");
+
+        // Auto-inject context for suggestions (Requirement: Click Behavior)
+        if (typeof overrideMsg === "string" && !userMsg.includes("@")) {
+            const targetContext = contextFile || folderName;
+            if (targetContext) {
+                const contextMention = targetContext.includes(" ") ? `@"${targetContext}"` : `@${targetContext}`;
+                userMsg = `${userMsg} ${contextMention}`;
+            }
+        }
         setShowSuggestions(false);
         setSuggestions([]);
         
@@ -136,7 +203,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                 content: response.answer,
                 sources: response.sources,
                 intent: response.intent,
-                type: response.type, // Store the document type
+                type: response.type,
             }]);
         } catch (err) {
             const detail = err?.response?.data?.detail || err.message || "Something went wrong.";
@@ -174,21 +241,47 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         }
     };
 
-    // Helper to format suggested follow-up questions or summary sections
     const renderAssistantContent = (msg) => {
         const isLegal = msg.type === "legal_case";
-        const content = msg.content || "";
+        const rawContent = msg.content || "";
         
-        // Split summary from questions if present
-        const parts = content.split("### Suggested Questions");
-        const summary = parts[0];
-        const questionsRaw = parts[1] || "";
-        
-        // Parse questions into an array
-        const questionsList = questionsRaw
-            .split(/\n/)
-            .map(q => q.replace(/^[-1-9.\s]+/, "").trim())
-            .filter(q => q.length > 5);
+        let summary = rawContent;
+        let questionsList = [];
+
+        try {
+            if (typeof rawContent === "object" && rawContent !== null) {
+                summary = rawContent.summary || "";
+                questionsList = rawContent.suggested_questions || [];
+            } else {
+                let jsonStr = rawContent.trim();
+
+                jsonStr = jsonStr.replace(/```json\s?([\s\S]*?)```/g, "$1").trim();
+                
+                if (!jsonStr.startsWith("{")) {
+                    const firstBrace = jsonStr.indexOf("{");
+                    const lastBrace = jsonStr.lastIndexOf("}");
+                    if (firstBrace !== -1 && lastBrace !== -1) {
+                        jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
+                    }
+                }
+
+                const data = JSON.parse(jsonStr);
+                // If summary is empty, show a fallback message rather than the raw JSON string
+                summary = (data.summary && data.summary.trim()) ? data.summary : (data.summary === "" ? "Summary could not be generated." : rawContent);
+                questionsList = data.suggested_questions || [];
+            }
+        } catch (err) {
+            console.warn("JSON parse failed, falling back to regex", err);
+            // Fallback 
+            const parts = typeof rawContent === "string" ? rawContent.split("### Suggested Questions") : ["", ""];
+            summary = parts[0] || (typeof rawContent === "string" ? rawContent : "");
+            const questionsRaw = parts[1] || "";
+            
+            questionsList = questionsRaw
+                .split(/\n/)
+                .map(q => q.replace(/^[-1-9.\s]+/, "").trim())
+                .filter(q => q.length > 5);
+        }
 
         return (
             <>
@@ -223,7 +316,9 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
 
                 <AssistantSuggestions 
                     questions={questionsList} 
-                    onQuery={(q) => handleSend(q)} 
+                    onQuery={(q, cf) => handleSend(q, cf)} 
+                    loading={loading}
+                    contextFile={msg.sources && msg.sources.length > 0 ? msg.sources[0].file : null}
                 />
             </>
         );
@@ -234,7 +329,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
             {/* Header */}
             <div style={{ padding: "16px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.1)", background: "rgba(102, 126, 234, 0.1)" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                    <span style={{ fontSize: "1.5rem" }}>🤖</span>
+                    <span style={{ fontSize: "1.5rem" }}></span>
                     <div>
                         <h3 style={{ margin: 0, fontSize: "1.1rem", color: "#F7FAFC" }}>AI Document Analyzer</h3>
                         {folderName && (

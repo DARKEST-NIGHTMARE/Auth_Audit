@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     clio_base_url: str = "https://app.clio.com"
 
     gemini_api_key: str = ""
+    cerebras_api_key: str = ""
+    generation_provider: str = "gemini"  # "gemini" or "cerebras"
+    cerebras_model: str = "qwen-3-235b-instruct"
     
     # class Coonfig:
     #     # env_file = ".env"

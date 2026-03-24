@@ -43,3 +43,4 @@ chromadb
 pdfplumber
 python-docx
 rapidfuzz
+cerebras-cloud-sdk
