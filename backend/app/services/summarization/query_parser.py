@@ -7,7 +7,7 @@ class Intent(str, Enum):
     SUMMARIZE = "summarize"
     QUESTION = "question"
     GENERAL = "general"
-
+0.
 @dataclass
 class ParsedQuery:
     original_text: str

@@ -29,8 +29,8 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     cerebras_api_key: str = ""
-    generation_provider: str = "gemini"  # "gemini" or "cerebras"
-    cerebras_model: str = "qwen-3-235b-instruct"
+    generation_provider: str = "cerebras"  # "gemini" or "cerebras"
+    cerebras_model: str = "llama3.1-8b"
     
     # class Coonfig:
     #     # env_file = ".env"

@@ -69,9 +69,13 @@ class DocumentExtractor:
     async def extract_from_bytes(self, content: bytes, mime_type: str, filename: str) -> str:
         """Entry point for extraction based on mime type."""
         try:
-            if "pdf" in mime_type.lower():
+            if content.startswith(b"%PDF"):
                 return self._extract_pdf(content)
-            elif "word" in mime_type.lower() or filename.endswith(".docx"):
+            
+            fn_low = filename.lower().strip()
+            if "pdf" in mime_type.lower() or fn_low.endswith(".pdf"):
+                return self._extract_pdf(content)
+            elif "word" in mime_type.lower() or fn_low.endswith((".docx", ".doc")):
                 return self._extract_docx(content)
             else:
                 return content.decode("utf-8", errors="ignore")

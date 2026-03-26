@@ -33,79 +33,54 @@ class CerebrasClient:
             "model": settings.cerebras_model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": 1024,
         }
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             try:
                 response = await client.post(self.api_url, headers=headers, json=payload)
-                if response.status_code == 401:
-                    logger.error("Cerebras Authentication Failed")
-                    raise RuntimeError("Cerebras Authentication Error")
+                if response.status_code != 200:
+                    err_body = response.text
+                    logger.error(f"Cerebras API Error [{response.status_code}]: {err_body}")
+                    raise RuntimeError(f"Cerebras returned {response.status_code}: {err_body}")
                 
-                response.raise_for_status()
                 data = response.json()
                 return data["choices"][0]["message"]["content"]
             except Exception as e:
-                logger.error(f"Cerebras Error: {e}")
+                logger.error(f"Cerebras Request Exception: {e}")
                 raise
-
-async def generate_text(prompt: str, system_instruction: Optional[str] = None) -> str:
-    """Routes ALL text generation tasks exclusively to Cerebras."""
-    if not settings.cerebras_api_key:
-        logger.error("CEREBRAS_API_KEY missing.")
-        raise RuntimeError("CEREBRAS_API_KEY not configured")
-
-    cerebras = CerebrasClient()
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            return await cerebras.generate(prompt, system_instruction=system_instruction)
-        except Exception as e:
-            if attempt < max_retries:
-                wait = 2.0 * (attempt + 1)
-                await asyncio.sleep(wait)
-                continue
-            raise RuntimeError(f"Cerebras exhausted retries: {e}")
-    raise RuntimeError("Cerebras generation failed")
-
-class LocalEmbeddingClient:
-    """Provides local sentence embeddings to bypass API rate limits."""
-    
-    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
-        self.model_name = model_name
-        self._model = None
-        
-    @property
-    def model(self):
-        if self._model is None:
-            try:
-                from fastembed import TextEmbedding
-                logger.info(f"Initializing Local Embedding Model: {self.model_name}")
-                self._model = TextEmbedding(model_name=self.model_name)
-            except ImportError:
-                logger.error("fastembed not installed. Local embeddings disabled.")
-                return None
-        return self._model
-
-    def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        if not self.model:
-            return []
-        try:
-            return [list(e) for e in self.model.embed(texts)]
-        except Exception as e:
-            logger.error(f"Local embedding error: {e}")
-            return []
-
 
 class GeminiClient:
     """Handles interactions with Google Gemini API for text generation and embeddings."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, model_name: Optional[str] = None):
         self.api_key = settings.gemini_api_key
-        self.model = model_name
+        self.model = model_name or (getattr(settings, "gemini_model", "gemini-2.0-flash"))
         self.embed_model = "models/gemini-embedding-001" 
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
+
+    async def generate(self, prompt: str, system_instruction: Optional[str] = None) -> str:
+        """Generate text utilizing Google Gemini API directly."""
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY missing.")
+            
+        url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": f"{system_instruction}\n\n{prompt}" if system_instruction else prompt}]
+            }],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024}
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception as e:
+                logger.error(f"Gemini Generation Error: {e}")
+                raise
 
     def embed(self, text: str) -> List[float]:
         """Generate embedding for a single string."""
@@ -134,4 +109,46 @@ class GeminiClient:
                 return [e["values"] for e in data.get("embeddings", [])]
         except Exception as e:
             logger.error(f"Gemini embedding batch error: {e}")
+            return []
+
+async def generate_text(prompt: str, system_instruction: Optional[str] = None) -> str:
+    """Routes text generation tasks specifically to Cerebras (Exclusive)."""
+    if not settings.cerebras_api_key:
+        logger.error("CEREBRAS_API_KEY is not configured.")
+        raise RuntimeError("Cerebras API key missing.")
+        
+    cerebras = CerebrasClient()
+    try:
+        return await cerebras.generate(prompt, system_instruction=system_instruction)
+    except Exception as e:
+        logger.error(f"Cerebras generation failed: {e}")
+        # Capture raw response if possible via the exception log
+        raise RuntimeError(f"Cerebras failed: {e}")
+
+class LocalEmbeddingClient:
+    """Provides local sentence embeddings to bypass API rate limits."""
+    
+    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
+        self.model_name = model_name
+        self._model = None
+        
+    @property
+    def model(self):
+        if self._model is None:
+            try:
+                from fastembed import TextEmbedding
+                logger.info(f"Initializing Local Embedding Model: {self.model_name}")
+                self._model = TextEmbedding(model_name=self.model_name)
+            except ImportError:
+                logger.error("fastembed not installed. Local embeddings disabled.")
+                return None
+        return self._model
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not self.model:
+            return []
+        try:
+            return [list(e) for e in self.model.embed(texts)]
+        except Exception as e:
+            logger.error(f"Local embedding error: {e}")
             return []

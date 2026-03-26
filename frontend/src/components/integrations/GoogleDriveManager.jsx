@@ -216,17 +216,19 @@ const GoogleDriveManager = () => {
             display: "flex", 
             flexWrap: "wrap",
             width: "100%", 
-            height: "100%", 
+            height: "calc(100vh - 250px)",
+            minHeight: "600px", 
             overflow: "hidden", 
             gap: aiExplorer.show ? "20px" : "0", 
             transition: "all 0.3s ease"
         }}>
-            <div className={`animate-fade-in ${layoutStyles.container} workspace-section`} style={{ 
-                flex: "3 1 600px", 
+            <div className={`animate-fade-in workspace-section`} style={{ 
+                flex: aiExplorer.show ? "1 1 50%" : "1 1 100%", 
                 minWidth: "300px", 
                 height: "100%", 
                 overflowY: "auto", 
-                position: "relative" 
+                position: "relative",
+                paddingRight: aiExplorer.show ? "10px" : "0"
             }}>
                 <input type="file" id="fileUpload" multiple style={{ display: "none" }} onChange={(e) => handleUploadFiles(e, analysis?.folder?.id)} />
                 <input type="file" id="folderUpload" webkitdirectory="true" style={{ display: "none" }} onChange={(e) => handleUploadFolder(e, analysis?.folder?.id)} />

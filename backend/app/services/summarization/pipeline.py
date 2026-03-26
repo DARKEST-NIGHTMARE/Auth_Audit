@@ -26,56 +26,51 @@ class SummarizationPipeline:
         self.prompt_builder = PromptBuilder()
         self._summary_cache: Dict[str, dict] = {}
 
-    def _parse_llm_json(self, response_text: str) -> dict:
-        """Force-clean and extract JSON from LLM output (Critical Sanitizer)."""
-        if not response_text:
-            return {"summary": "No content generated.", "suggested_questions": []}
+    def _parse_llm_json(self, text: str) -> dict:
+        """Robustly extracts JSON data from AI provider responses."""
+        if not text:
+            return {"summary": "Empty response from AI.", "suggested_questions": []}
             
-        text = str(response_text).strip()
-        
-        # 1. Clean common markdown wrappers
-        text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE | re.IGNORECASE)
-        text = re.sub(r"```$", "", text, flags=re.MULTILINE)
-        text = text.strip()
-
-        # 2. Strategy A: Direct JSON parse
+        # 1. Attempt pure JSON extraction
         try:
-            return json.loads(text)
-        except Exception:
-            pass
-
-        # 3. Strategy B: Extract the LARGEST balanced { } block
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
+            # Strip markdown if present
+            clean = re.sub(r'```(?:json)?\s*', '', text)
+            clean = re.sub(r'\s*```', '', clean).strip()
+            
+            # Isolate the JSON object
+            start = clean.find('{')
+            end = clean.rfind('}')
             if start != -1 and end != -1:
-                candidate = text[start : end + 1]
-                return json.loads(candidate)
+                json_candidate = clean[start:end+1]
+                data = json.loads(json_candidate)
+                if "summary" in data:
+                    return {
+                        "summary": str(data["summary"]),
+                        "suggested_questions": data.get("suggested_questions", [])
+                    }
         except Exception:
             pass
 
-        # 4. Strategy C: Boundary-based field extraction
+        # 2. Regex fallbacks for partially broken JSON
         res = {"summary": "", "suggested_questions": []}
-        summary_start = re.search(r'"summary":\s*"', text, re.I)
-        if summary_start:
-            start_pos = summary_start.end()
-            marker = re.search(r'",\s*"suggested_questions"', text[start_pos:], re.I)
-            if marker:
-                res["summary"] = text[start_pos : start_pos + marker.start()].strip()
-                questions_text = text[start_pos + marker.end():]
-                res["suggested_questions"] = re.findall(r'"([^"]{10,}\?)"', questions_text)
-            else:
-                last_brace = text.rfind("}")
-                if last_brace > start_pos:
-                    res["summary"] = text[start_pos : last_brace].strip()
         
-        if not res["summary"] or len(res["summary"]) < 50:
-            res["summary"] = text
-            res["suggested_questions"] = re.findall(r'"([^"]{10,}\?)"', text)
+        # Match summary field
+        s_match = re.search(r'"summary":\s*"(.+?)"(?=,\s*"suggested_questions"|\s*\})', text, re.S)
+        if s_match:
+            res["summary"] = s_match.group(1).replace('\\"', '"').replace('\\n', '\n')
+            
+        # Match questions array
+        q_match = re.search(r'"suggested_questions":\s*\[(.+?)\]', text, re.S)
+        if q_match:
+            res["suggested_questions"] = re.findall(r'"([^"]{10,}\?)"', q_match.group(1))
 
-        summary_val = res.get("summary", "")
-        if isinstance(summary_val, str):
-            res["summary"] = summary_val.replace('\\"', '"').replace('\\n', '\n')
+        # 3. Final recovery: If no summary extracted, return raw text cleaned up
+        if not res["summary"] or len(res["summary"]) < 20:
+            # Remove JSON-like artifacts from the start/end
+            refined = text.strip().strip('{}').strip()
+            # Strip leading key names if the LLM didn't format it right
+            refined = re.sub(r'^"?summary"?:\s*"?', '', refined, flags=re.I)
+            res["summary"] = refined
             
         return res
 
@@ -89,9 +84,14 @@ class SummarizationPipeline:
 
     def _local_extractive_summary(self, text: str, file_name: str) -> str:
         """Generates a text-based extractive summary without any API calls."""
-        snippet = text[:1500].strip()
-        if not snippet:
-            snippet = "(No readable text found in document)"
+        # Detect if we are looking at raw binary data (PDF/DOCX fall-through)
+        if text.startswith("%PDF") or b"\x00" in text[:100].encode("utf-8", "ignore"):
+            snippet = "(Binary data detected. Summary unavailable. Please re-index this document.)"
+        else:
+            snippet = text[:1500].strip()
+            if not snippet:
+                snippet = "(No readable text found in document)"
+                
         return (
             f"**Notice: AI Generation Paused (Quota Stability).**\n\n"
             f"**Preliminary Document Excerpt ({file_name}):**\n"
@@ -130,18 +130,27 @@ class SummarizationPipeline:
                         all_docs.append((metadata.get("chunk_index", 0), doc))
             await asyncio.sleep(0.5)
         all_docs.sort(key=lambda x: x[0])
-        return "\n\n".join([d[1] for d in all_docs])
+        
+        ctx = ""
+        for _, doc in all_docs:
+            if len(ctx) > 12000:
+                break
+            ctx += f"{doc}\n\n"
+        return ctx
 
-    async def ingest_file(self, file_id: str, file_name: str, access_token: str, refresh_token: str = None, folder_id: Optional[str] = None) -> dict:
+    async def ingest_file(self, file_id: str, file_name: str, access_token: str, refresh_token: str = None, folder_id: Optional[str] = None, drive_modified: Optional[str] = None, mime_type: Optional[str] = None) -> dict:
         try:
             from app.services.google_drive_service import drive_service
-            meta = drive_service.get_file_metadata(file_id, access_token, refresh_token)
-            mime_type = meta.get('mimeType', '')
+            
+            if not drive_modified or not mime_type:
+                meta = drive_service.get_file_metadata(file_id, access_token, refresh_token)
+                mime_type = meta.get('mimeType', '')
+                drive_modified = meta.get('modifiedTime')
+                
             indexed_meta = self.vector_store.get_file_metadata_from_index(file_id)
-            drive_modified = meta.get('modifiedTime')
             
             if indexed_meta and drive_modified == indexed_meta.get('last_modified'):
-                return {"status": "indexed", "file": file_name, "reason": "fast_skip"}
+                return {"status": "unchanged", "file": file_name, "reason": "fast_skip"}
 
             content = drive_service.download_file_bytes(file_id, access_token, refresh_token)
             if not content:
@@ -149,7 +158,7 @@ class SummarizationPipeline:
             
             content_hash = hashlib.md5(content).hexdigest()
             if indexed_meta and content_hash == indexed_meta.get('content_hash'):
-                return {"status": "indexed", "file": file_name, "reason": "hash_match"}
+                return {"status": "unchanged", "file": file_name, "reason": "hash_match"}
 
             text = await self.extractor.extract_from_bytes(content, mime_type, file_name)
             if not text or len(text.strip()) < 10:
@@ -169,25 +178,53 @@ class SummarizationPipeline:
     async def ingest_folder(self, folder_id: str, access_token: str, refresh_token: str = None) -> dict:
         from app.services.google_drive_service import drive_service
         try:
-            if self.vector_store.is_folder_indexed(folder_id):
-                return {"status": "complete", "message": "cached", "indexed": 0}
+            # Sync index state from disk to catch external resets (reset_db.py)
+            self.vector_store._folder_index = self.vector_store._load_folder_index()
 
             service = drive_service.get_client(access_token, refresh_token)
             query = f"'{folder_id}' in parents and trashed=false"
-            results = service.files().list(q=query, fields="files(id, name, mimeType)", pageSize=200).execute()
-            files = results.get("files", [])
+            logger.info(f"📁 Scanning Folder ID: {folder_id} for changes...")
             
-            ingestion_results = []
+            results = service.files().list(
+                q=query, 
+                fields="files(id, name, mimeType, modifiedTime)", 
+                pageSize=200,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            files = results.get("files", [])
+            logger.info(f"🔍 Found {len(files)} items in folder {folder_id}")
+            
+            total_indexed = 0
+            total_found = 0
+            
+            # Detect deleted files from Drive and prune them from ChromaDB
+            current_file_ids = {f["id"] for f in files if "folder" not in f.get("mimeType", "")}
+            indexed_file_ids = self.vector_store.get_indexed_file_ids_for_folder(folder_id)
+            for old_id in indexed_file_ids:
+                if old_id not in current_file_ids:
+                    logger.info(f"🗑️ File {old_id} removed from Drive. Deleting chunks.")
+                    self.vector_store.delete_file_chunks(old_id)
+                    total_indexed += 1 # Count deletion as an index change to auto-invalidate caches
+
             for f in files:
                 if "folder" in f.get("mimeType", ""):
-                    await self.ingest_folder(f["id"], access_token, refresh_token)
+                    # Recursive aggregation
+                    sub_res = await self.ingest_folder(f["id"], access_token, refresh_token)
+                    total_indexed += sub_res.get("indexed", 0)
+                    total_found += sub_res.get("total_files", 0)
                 else:
-                    res = await self.ingest_file(f["id"], f["name"], access_token, refresh_token, folder_id=folder_id)
-                    ingestion_results.append(res)
+                    res = await self.ingest_file(f["id"], f["name"], access_token, refresh_token, folder_id=folder_id, drive_modified=f.get("modifiedTime"), mime_type=f.get("mimeType"))
+                    if res.get("status") == "indexed":
+                        total_indexed += 1
+                    total_found += 1
+
+            if total_indexed > 0:
+                logger.info(f"🔄 Detected {total_indexed} changes in {folder_id}. Invalidating summary cache.")
+                self._summary_cache.pop(folder_id, None)
 
             self.vector_store.mark_folder_indexed(folder_id)
-            indexed = sum(1 for r in ingestion_results if r.get("status") == "indexed")
-            return {"status": "complete", "indexed": indexed}
+            return {"status": "complete", "indexed": total_indexed, "total_files": total_found}
         except Exception as e:
             logger.error(f"Folder ingest error: {e}")
             return {"status": "error", "error": str(e)}
@@ -207,14 +244,12 @@ class SummarizationPipeline:
                 resolved_items.append({"id": implicit["id"], "name": implicit["name"], "type": "folder" if implicit["is_folder"] else "file"})
 
         if not resolved_items:
-            if parsed.intent == Intent.QUESTION:
-                return await self._answer_question(parsed.remaining_text, [], [], folder_id=None)
-            return {"answer": "Specify a file/folder to analyze.", "sources": []}
+            query_str = parsed.remaining_text if parsed.remaining_text else text
+            return await self._answer_question(query_str, [], [], folder_id=None)
 
         for item in resolved_items:
             if item["type"] == "folder":
-                if not self.vector_store.is_folder_indexed(item["id"]):
-                    await self.ingest_folder(item["id"], access_token, refresh_token)
+                await self.ingest_folder(item["id"], access_token, refresh_token)
             elif not self.vector_store.is_file_indexed(item["id"]):
                 await self.ingest_file(item["id"], item["name"], access_token, refresh_token)
         
@@ -298,20 +333,45 @@ class SummarizationPipeline:
 
     async def _summarize_folder(self, folder_id: str, folder_name: str, access_token: str, refresh_token: str = None) -> dict:
         if folder_id in self._summary_cache: return self._summary_cache[folder_id]
-        results = self.vector_store.query(f"summarize {folder_name}", folder_id=folder_id, top_k=30)
-        chunks = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
         
-        if len(chunks) > 5:
+        # Get all chunks for the folder to ensure diverse representation
+        results = self.vector_store.collection.get(
+            where={"folder_id": folder_id},
+            include=["documents", "metadatas"]
+        )
+        
+        docs = results.get("documents", [])
+        metas = results.get("metadatas", [])
+        
+        if len(docs) > 0:
+            from collections import defaultdict
+            file_chunks = defaultdict(list)
+            for doc, meta in zip(docs, metas):
+                fname = meta.get("file_name", "Unknown")
+                file_chunks[fname].append(doc)
+
             context = ""
             sources = set()
-            for i, text in enumerate(chunks):
-                fname = metas[i].get("file_name", "Unknown")
-                context += f"--- {fname} ---\n{text}\n\n"
+            
+            for fname, chunks in file_chunks.items():
                 sources.add(fname)
+                context += f"--- {fname} ---\n"
+                for text in chunks[:3]:
+                    if len(context) > 12000: # Safer limit for Cerebras 8k token context window
+                        break
+                    
+                    if "%PDF" in text[:100] or b"\x00" in text[:100].encode("utf-8", "ignore"):
+                        context += "[Binary content redacted for stability]\n\n"
+                        continue
+                        
+                    context += f"{text}\n\n"
+                if len(context) > 12000:
+                    break
+                
             prompt = self.prompt_builder.build_folder_summary_prompt(folder_name, context, len(sources))
             ans = await self._generate_with_fallback(prompt, PromptBuilder.SYSTEM_INSTRUCTION, folder_name, context[:2000])
-            res = {"type": "folder_summary", "answer": json.dumps(self._parse_llm_json(ans)), "sources": [{"file": s} for s in sorted(list(sources))], "intent": "summarize"}
+            parsed = self._parse_llm_json(ans)
+            res = {"type": "folder_summary", "answer": json.dumps(parsed), "sources": [{"file": s} for s in sorted(list(sources))], "intent": "summarize"}
             self._summary_cache[folder_id] = res
             return res
 
@@ -322,10 +382,23 @@ class SummarizationPipeline:
         if not results or not results.get("documents") or not results["documents"][0]:
             return {"answer": "No relevant content found.", "sources": []}
         docs, metas = results["documents"][0], results["metadatas"][0]
-        ctx = "\n\n".join([f"[{m.get('file_name', 'unknown')}]: {doc}" for doc, m in zip(docs, metas)])
-        prompt = self.prompt_builder.build_question_prompt(question, ctx, ", ".join(file_names))
+        
+        ctx = ""
+        seen_files = []
+        for doc, meta in zip(docs, metas):
+            if len(ctx) > 12000:
+                break
+            if "%PDF" in doc[:100] or b"\x00" in doc[:100].encode("utf-8", "ignore"):
+                continue
+                
+            fname = meta.get("file_name", "unknown")
+            if fname not in seen_files:
+                seen_files.append(fname)
+            ctx += f"[{fname}]: {doc}\n\n"
+            
+        files_str = ", ".join(seen_files) if seen_files else "Global Knowledge Base"
+        prompt = self.prompt_builder.build_question_prompt(question, ctx, files_str)
         ans = await self._generate_with_fallback(prompt, PromptBuilder.SYSTEM_INSTRUCTION, "Search", ctx[:1000])
-        seen_files = list({m.get("file_name", "unknown") for m in metas})
         return {"answer": json.dumps(self._parse_llm_json(ans)), "sources": [{"file": f} for f in seen_files], "intent": "question"}
 
 summarization_pipeline = SummarizationPipeline()

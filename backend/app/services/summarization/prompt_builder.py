@@ -27,9 +27,9 @@ IMPORTANT: Return your output strictly as a JSON object with these keys:
 Do NOT include any text before or after the JSON block. The "summary" field must contain the full analysis."""
 
 
-    FOLDER_SUMMARY_PROMPT = """TASK: Provide a high-level summary of the folder "{folder_name}" based on the summaries of its contents.
+    FOLDER_SUMMARY_PROMPT = """TASK: Provide a high-level summary of the folder "{folder_name}" and suggest follow-up questions based on its contents.
 
-FILE SUMMARIES:
+FILE EXCERPTS:
 ---
 {combined_text}
 ---
@@ -38,6 +38,7 @@ INSTRUCTIONS:
 1. Synthesize the overall purpose of these {num_files} files.
 2. Highlight cross-document themes or relationships.
 3. Keep it professional and concise.
+4. IMPORTANT: You MUST generate 3-5 specific follow-up questions exploring the contents of these documents.
 
 {json_instruction}
 """

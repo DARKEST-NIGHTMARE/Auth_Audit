@@ -108,7 +108,9 @@ class GoogleDriveService:
                 q="mimeType='application/vnd.google-apps.folder' and trashed=false",
                 pageSize=100,
                 fields="nextPageToken, files(id, name, createdTime, modifiedTime, parents)",
-                orderBy="name"
+                orderBy="name",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
             ).execute()
             
             return results.get('files', [])
@@ -123,7 +125,9 @@ class GoogleDriveService:
                 q="trashed=false",
                 pageSize=200,
                 fields="nextPageToken, files(id, name, mimeType)",
-                orderBy="name"
+                orderBy="name",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
             ).execute()
             
             return results.get('files', [])
@@ -138,7 +142,9 @@ class GoogleDriveService:
             results = service.files().list(
                 q=query,
                 fields="files(id, name, mimeType, size, modifiedTime)",
-                pageSize=1000
+                pageSize=1000,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
             ).execute()
             
             files = results.get('files', [])

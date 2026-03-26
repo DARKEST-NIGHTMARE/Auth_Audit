@@ -48,7 +48,7 @@ const WorkspaceFolderView = ({
                     </div>
                 </div>
                 
-                <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: "10px", overflow: "hidden" }}>
+                <div style={{ background: "rgba(0,0,0,0.2)", borderRadius: "10px", maxHeight: "400px", overflowY: "auto", overflowX: "hidden" }}>
                     <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
                         {analysis.files.length === 0 ? (
                             <li style={{ padding: "40px", textAlign: "center", color: "#718096" }}>This folder is empty. Use the buttons above to add content.</li>
@@ -61,16 +61,16 @@ const WorkspaceFolderView = ({
                                     onMouseOver={(e) => { if(file.mimeType.includes('folder')) e.currentTarget.style.background = "rgba(102, 126, 234, 0.05)"; }}
                                     onMouseOut={(e) => { e.currentTarget.style.background = "transparent"; }}
                                 >
-                                    <div style={{ display: "flex", alignItems: "center", gap: "15px" }}>
-                                        <span style={{ fontSize: "1.6rem" }}>{file.mimeType.includes('folder') ? '📁' : '📄'}</span>
-                                        <div>
-                                            <div style={{ color: "#F7FAFC", fontWeight: "600", fontSize: "1rem", textDecoration: file.mimeType.includes('folder') ? "underline rgba(102, 126, 234, 0.3)" : "none" }}>{file.name}</div>
-                                            <div style={{ fontSize: "0.75rem", color: "#718096" }}>{file.mimeType.includes('folder') ? 'Sub-folder (Click to open)' : file.mimeType}</div>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "15px", flex: 1, minWidth: 0, paddingRight: "15px" }}>
+                                        <span style={{ fontSize: "1.6rem", flexShrink: 0 }}>{file.mimeType.includes('folder') ? '📁' : '📄'}</span>
+                                        <div style={{ flex: 1, minWidth: 0 }}>
+                                            <div style={{ color: "#F7FAFC", fontWeight: "600", fontSize: "1rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", textDecoration: file.mimeType.includes('folder') ? "underline rgba(102, 126, 234, 0.3)" : "none" }}>{file.name}</div>
+                                            <div style={{ fontSize: "0.75rem", color: "#718096", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{file.mimeType.includes('folder') ? 'Sub-folder (Click to open)' : file.mimeType}</div>
                                         </div>
                                     </div>
-                                    <div style={{ display: "flex", alignItems: "center", gap: "20px" }}>
-                                        {file.size && <span style={{ color: "#718096", fontSize: "0.85rem" }}>{parseInt(file.size) < 1024 * 1024 ? `${(parseInt(file.size)/1024).toFixed(1)} KB` : `${(parseInt(file.size)/(1024*1024)).toFixed(1)} MB`}</span>}
-                                        <button onClick={(e) => { e.stopPropagation(); handleDelete(file.id, file.mimeType.includes('folder')); }} className={buttonStyles.btnDelete} style={{ padding: "5px", width: "36px", height: "36px", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "8px" }} title="Move to trash">🗑️</button>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "20px", flexShrink: 0 }}>
+                                        {file.size && <span style={{ color: "#718096", fontSize: "0.85rem", whiteSpace: "nowrap" }}>{parseInt(file.size) < 1024 * 1024 ? `${(parseInt(file.size)/1024).toFixed(1)} KB` : `${(parseInt(file.size)/(1024*1024)).toFixed(1)} MB`}</span>}
+                                        <button onClick={(e) => { e.stopPropagation(); handleDelete(file.id, file.mimeType.includes('folder')); }} className={buttonStyles.btnDelete} style={{ padding: "5px", width: "36px", height: "36px", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "8px" }} title="Move to trash">🗑️</button>
                                     </div>
                                 </li>
                             ))

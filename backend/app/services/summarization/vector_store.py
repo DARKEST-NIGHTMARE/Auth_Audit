@@ -205,6 +205,30 @@ class VectorStoreManager:
         except Exception as e:
             logger.error(f"Error deleting chunks for {file_id}: {e}")
 
+    def clear_all_data(self):
+        """Purge the entire vector database and folder index."""
+        try:
+            # 1. Clear Chroma Collection
+            count = self.collection.count()
+            if count > 0:
+                # We can't easily 'delete all' by filter in some versions, 
+                # but we can delete by getting all IDs.
+                all_ids = self.collection.get()["ids"]
+                if all_ids:
+                    self.collection.delete(ids=all_ids)
+                logger.info(f"Purged {len(all_ids)} chunks from Chroma.")
+
+            # 2. Reset Folder Index
+            self._folder_index = {}
+            if os.path.exists(self._folder_index_path):
+                os.remove(self._folder_index_path)
+                logger.info("Deleted folder_index.json")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear vector data: {e}")
+            return False
+
     def get_indexed_file_ids(self) -> set:
         """Get all unique file_ids in the collection."""
         try:
@@ -213,6 +237,16 @@ class VectorStoreManager:
                 return {m["file_id"] for m in results["metadatas"] if "file_id" in m}
         except Exception:
             pass
+        return set()
+
+    def get_indexed_file_ids_for_folder(self, folder_id: str) -> set:
+        """Get all unique file_ids indexed under a specific folder."""
+        try:
+            results = self.collection.get(where={"folder_id": folder_id}, include=["metadatas"])
+            if results and results["metadatas"]:
+                return {m["file_id"] for m in results["metadatas"] if "file_id" in m}
+        except Exception as e:
+            logger.error(f"Error getting file ids for folder: {e}")
         return set()
 
     def is_file_indexed(self, file_id: str, content_hash: Optional[str] = None, last_modified: Optional[str] = None) -> bool:
