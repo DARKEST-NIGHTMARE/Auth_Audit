@@ -73,14 +73,16 @@ async def get_current_user(
             stmt = select(UserSession).where(UserSession.id == session_id)
             result = await db.execute(stmt)
             active_session = result.scalars().first()
-            if not active_session or not active_session.is_active:
-                raise HTTPException(status_code=401, detail="Session revoked or invalid")
+            if not active_session:
+                raise HTTPException(status_code=401, detail="Session not found in database")
+            if not active_session.is_active:
+                raise HTTPException(status_code=401, detail="Session has been revoked or is inactive")
                 
         return payload 
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(status_code=401, detail="Access token expired")
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid token signature or format")
 
 async def get_current_admin(
     user: dict = Depends(get_current_user), 

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
 import { summarizationApi } from "../../services/summarizationApi";
 
 const AssistantSuggestions = ({ questions, onQuery, loading, contextFile }) => {
@@ -245,18 +246,36 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         const isLegal = msg.type === "legal_case";
         const rawContent = msg.content || "";
         
-        let summary = rawContent;
+        let summary = "";
         let questionsList = [];
 
-        try {
-            if (typeof rawContent === "object" && rawContent !== null) {
-                summary = rawContent.summary || "";
-                questionsList = rawContent.suggested_questions || [];
-            } else {
-                let jsonStr = rawContent.trim();
+        // Logic for extracting content from potentially messy LLM output
+        const cleanAndExtract = (text) => {
+            if (!text) return { summary: "", questions: [] };
+            
+            // 0. Handle direct error strings from the API catch block
+            if (typeof text === "string" && text.trim().startsWith("❌")) {
+                return {
+                    summary: text,
+                    questions: []
+                };
+            }
+            
+            // 1. If it's already an object, use it directly
+            if (typeof text === "object") {
+                return {
+                    summary: text.summary || "",
+                    questions: text.suggested_questions || []
+                };
+            }
 
+            try {
+                // 2. Try standard JSON parse
+                let jsonStr = text.trim();
+                // Strip markdown code blocks
                 jsonStr = jsonStr.replace(/```json\s?([\s\S]*?)```/g, "$1").trim();
                 
+                // If it doesn't start with { but contains a { ... } block
                 if (!jsonStr.startsWith("{")) {
                     const firstBrace = jsonStr.indexOf("{");
                     const lastBrace = jsonStr.lastIndexOf("}");
@@ -266,22 +285,49 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                 }
 
                 const data = JSON.parse(jsonStr);
-                // If summary is empty, show a fallback message rather than the raw JSON string
-                summary = (data.summary && data.summary.trim()) ? data.summary : (data.summary === "" ? "Summary could not be generated." : rawContent);
-                questionsList = data.suggested_questions || [];
+                return {
+                    summary: data.summary || "",
+                    questions: data.suggested_questions || []
+                };
+            } catch (err) {
+                // 3. Fallback: Aggressive Regex for messy / leaking JSON
+                // Match the content inside "summary": "..."
+                const summaryMatch = text.match(/"summary":\s*"(.*?)"(?=,\s*"|}|\])/s) || 
+                                   text.match(/"summary":\s*([\s\S]*?)(?=,\s*"suggested|$)/s);
+                
+                let extractedSummary = summaryMatch ? summaryMatch[1] : text;
+                
+                // Clean up technical artifacts if the regex fallback was hit
+                extractedSummary = extractedSummary
+                    .replace(/^[\s\n{"]+/, "")
+                    .replace(/[\s\n}"]+$/, "")
+                    .replace(/\\n/g, "\n")
+                    .replace(/\\"/g, '"');
+
+                // Extract questions
+                const questionsMatch = text.match(/"suggested_questions":\s*\[(.*?)\]/s);
+                let extractedQuestions = [];
+                if (questionsMatch) {
+                    try {
+                        extractedQuestions = JSON.parse(`[${questionsMatch[1]}]`);
+                    } catch {
+                        extractedQuestions = questionsMatch[1]
+                            .split(",")
+                            .map(q => q.replace(/["'\[\]]/g, "").trim())
+                            .filter(q => q.length > 5);
+                    }
+                }
+
+                return {
+                    summary: extractedSummary,
+                    questions: extractedQuestions
+                };
             }
-        } catch (err) {
-            console.warn("JSON parse failed, falling back to regex", err);
-            // Fallback 
-            const parts = typeof rawContent === "string" ? rawContent.split("### Suggested Questions") : ["", ""];
-            summary = parts[0] || (typeof rawContent === "string" ? rawContent : "");
-            const questionsRaw = parts[1] || "";
-            
-            questionsList = questionsRaw
-                .split(/\n/)
-                .map(q => q.replace(/^[-1-9.\s]+/, "").trim())
-                .filter(q => q.length > 5);
-        }
+        };
+
+        const result = cleanAndExtract(rawContent);
+        summary = result.summary || "No summary available.";
+        questionsList = result.questions || [];
 
         return (
             <>
@@ -289,11 +335,12 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                     fontSize: "0.7rem", 
                     color: isLegal ? "#f6ad55" : "#667eea", 
                     fontWeight: "bold", 
-                    marginBottom: msg.type ? "10px" : "6px", 
+                    marginBottom: msg.type ? "12px" : "8px", 
                     textTransform: "uppercase",
                     display: "flex",
                     alignItems: "center",
-                    gap: "6px"
+                    gap: "6px",
+                    letterSpacing: "0.05em"
                 }}>
                     {isLegal ? "⚖️ Legal Case Analysis" : msg.type === "general_document" ? "📄 General Document Analysis" : "🤖 AI Response"}
                     {msg.type && (
@@ -310,8 +357,33 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                     )}
                 </div>
                 
-                <div style={{ color: "#E2E8F0", whiteSpace: "pre-wrap" }}>
-                    {summary}
+                <div className="markdown-content" style={{ 
+                    color: "#E2E8F0", 
+                    lineHeight: 1.75,
+                    fontSize: "0.95rem"
+                }}>
+                    <ReactMarkdown 
+                        components={{
+                            p: ({node, ...props}) => <p style={{ margin: "0 0 1rem 0" }} {...props} />,
+                            h1: ({node, ...props}) => <h1 style={{ color: "#F7FAFC", fontSize: "1.2rem", margin: "1.5rem 0 0.8rem 0", borderBottom: "1px solid rgba(255,255,255,0.1)", paddingBottom: "4px" }} {...props} />,
+                            h2: ({node, ...props}) => <h2 style={{ color: "#F7FAFC", fontSize: "1.1rem", margin: "1.2rem 0 0.6rem 0" }} {...props} />,
+                            h3: ({node, ...props}) => <h3 style={{ color: "#F7FAFC", fontSize: "1rem", margin: "1rem 0 0.5rem 0" }} {...props} />,
+                            strong: ({node, ...props}) => <strong style={{ color: "#667eea", fontWeight: "600" }} {...props} />,
+                            ul: ({node, ...props}) => <ul style={{ paddingLeft: "1.2rem", margin: "0.5rem 0 1rem 0" }} {...props} />,
+                            li: ({node, ...props}) => <li style={{ marginBottom: "0.4rem" }} {...props} />,
+                            code: ({node, inline, ...props}) => (
+                                <code style={{ 
+                                    background: "rgba(102,126,234,0.15)", 
+                                    padding: "2px 5px", 
+                                    borderRadius: "4px", 
+                                    fontSize: "0.85rem",
+                                    fontFamily: "monospace"
+                                }} {...props} />
+                            )
+                        }}
+                    >
+                        {summary}
+                    </ReactMarkdown>
                 </div>
 
                 <AssistantSuggestions 

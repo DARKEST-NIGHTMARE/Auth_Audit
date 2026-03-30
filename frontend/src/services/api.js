@@ -27,13 +27,36 @@ api.interceptors.request.use((config) => {
 });
 
 // res interceptor to handle 401 globally
+let isRefreshing = false;
+let refreshSubscribers = [];
+
+const subscribeTokenRefresh = (cb) => {
+  refreshSubscribers.push(cb);
+};
+
+const onRefreshed = (token) => {
+  refreshSubscribers.map((cb) => cb(token));
+  refreshSubscribers = [];
+};
+
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
-    const originalRequest = error.config;
+    const { config, response } = error;
+    const originalRequest = config;
 
-    if (error.response && error.response.status === 401 && !originalRequest._retry) {
+    if (response && response.status === 401 && !originalRequest._retry) {
+      if (isRefreshing) {
+        return new Promise((resolve) => {
+          subscribeTokenRefresh((token) => {
+            originalRequest.headers.Authorization = `Bearer ${token}`;
+            resolve(api(originalRequest));
+          });
+        });
+      }
+
       originalRequest._retry = true;
+      isRefreshing = true;
 
       try {
         const res = await axios.post(`${API_URL}/api/auth/refresh`, {}, {
@@ -41,11 +64,17 @@ api.interceptors.response.use(
         });
 
         const newToken = res.data.token;
+        isRefreshing = false;
+        
         localStorage.setItem("token", newToken);
+        onRefreshed(newToken);
+        
         originalRequest.headers.Authorization = `Bearer ${newToken}`;
         return api(originalRequest);
       }
       catch (refreshError) {
+        isRefreshing = false;
+        refreshSubscribers = [];
         console.warn("Session expired. Logging out...");
 
         if (store) {

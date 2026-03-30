@@ -88,10 +88,18 @@ class DocumentExtractor:
         text = ""
         try:
             with pdfplumber.open(io.BytesIO(content)) as pdf:
+                page_count = len(pdf.pages)
                 for page in pdf.pages:
                     page_text = page.extract_text()
                     if page_text:
                         text += page_text + "\n"
+                
+                total_chars = len(text.strip())
+                logger.info(f"PDF Extraction: {page_count} pages, {total_chars} characters found.")
+                
+                if page_count > 0 and total_chars == 0:
+                    logger.warning("⚠️ Scanned PDF detected (pages exist but no text found). OCR required.")
+                    
             return text
         except Exception as e:
             logger.error(f"PDF extraction error: {e}")

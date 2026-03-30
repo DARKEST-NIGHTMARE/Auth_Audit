@@ -51,18 +51,23 @@ class SummarizationPipeline:
         except Exception:
             pass
 
-        # 2. Regex fallbacks for partially broken JSON
+        # 2. Case-insensitive Regex fallbacks for partially broken JSON
         res = {"summary": "", "suggested_questions": []}
         
-        # Match summary field
-        s_match = re.search(r'"summary":\s*"(.+?)"(?=,\s*"suggested_questions"|\s*\})', text, re.S)
+        # Match summary field (case-insensitive)
+        s_match = re.search(r'["\']summary["\']:\s*["\'](.*?)["\'](?=,\s*["\']|\s*\})', text, re.I | re.S)
         if s_match:
             res["summary"] = s_match.group(1).replace('\\"', '"').replace('\\n', '\n')
-            
-        # Match questions array
-        q_match = re.search(r'"suggested_questions":\s*\[(.+?)\]', text, re.S)
+        elif not res["summary"]:
+            # Aggressive fallback
+            s_match_alt = re.search(r'summary["\']?:\s*([\s\S]*?)(?=,?\s*["\']suggested|$)', text, re.I)
+            if s_match_alt:
+                res["summary"] = s_match_alt.group(1).strip().strip('"\'{},')
+
+        # Match questions array (case-insensitive)
+        q_match = re.search(r'["\']suggested_questions["\']:\s*\[([\s\S]*?)\]', text, re.I | re.S)
         if q_match:
-            res["suggested_questions"] = re.findall(r'"([^"]{10,}\?)"', q_match.group(1))
+            res["suggested_questions"] = re.findall(r'["\']([^"\']{5,}\?)["\']', q_match.group(1))
 
         # 3. Final recovery: If no summary extracted, return raw text cleaned up
         if not res["summary"] or len(res["summary"]) < 20:
@@ -147,9 +152,15 @@ class SummarizationPipeline:
                 mime_type = meta.get('mimeType', '')
                 drive_modified = meta.get('modifiedTime')
                 
-            indexed_meta = self.vector_store.get_file_metadata_from_index(file_id)
+            indexed_meta = self.vector_store.get_file_metadata(file_id)
             
             if indexed_meta and drive_modified == indexed_meta.get('last_modified'):
+                # If content is same but folder changed, update metadata so it shows up in queries
+                if folder_id and indexed_meta.get('folder_id') != folder_id:
+                    logger.info(f"📁 Folder move detected for {file_name}. Updating metadata.")
+                    self.vector_store.update_file_metadata(file_id, {"folder_id": folder_id})
+                    return {"status": "metadata_updated", "file": file_name}
+                
                 return {"status": "unchanged", "file": file_name, "reason": "fast_skip"}
 
             content = drive_service.download_file_bytes(file_id, access_token, refresh_token)
@@ -162,7 +173,8 @@ class SummarizationPipeline:
 
             text = await self.extractor.extract_from_bytes(content, mime_type, file_name)
             if not text or len(text.strip()) < 10:
-                return {"status": "skipped", "reason": "too_short", "file": file_name}
+                logger.warning(f"⚠️ Text extraction returned nearly empty content for {file_name}. (Possibly a scanned document without OCR)")
+                return {"status": "skipped", "reason": "too_short_possibly_scanned", "file": file_name}
 
             doc_type = await self._classify_document_type(text)
             chunks = self.chunker.chunk_text(text, file_id, file_name)
@@ -197,6 +209,7 @@ class SummarizationPipeline:
             
             total_indexed = 0
             total_found = 0
+            all_folder_ids = [folder_id]
             
             # Detect deleted files from Drive and prune them from ChromaDB
             current_file_ids = {f["id"] for f in files if "folder" not in f.get("mimeType", "")}
@@ -208,26 +221,40 @@ class SummarizationPipeline:
                     total_indexed += 1 # Count deletion as an index change to auto-invalidate caches
 
             for f in files:
+                item_name = f.get("name", "Unknown")
+                item_id = f.get("id")
                 if "folder" in f.get("mimeType", ""):
-                    # Recursive aggregation
-                    sub_res = await self.ingest_folder(f["id"], access_token, refresh_token)
+                    logger.info(f"📁 Recursing into subfolder: {item_name} ({item_id})")
+                    sub_res = await self.ingest_folder(item_id, access_token, refresh_token)
                     total_indexed += sub_res.get("indexed", 0)
                     total_found += sub_res.get("total_files", 0)
+                    all_folder_ids.extend(sub_res.get("all_folder_ids", []))
                 else:
-                    res = await self.ingest_file(f["id"], f["name"], access_token, refresh_token, folder_id=folder_id, drive_modified=f.get("modifiedTime"), mime_type=f.get("mimeType"))
-                    if res.get("status") == "indexed":
+                    logger.info(f"📄 Processing file: {item_name} ({item_id})")
+                    res = await self.ingest_file(item_id, item_name, access_token, refresh_token, folder_id=folder_id, drive_modified=f.get("modifiedTime"), mime_type=f.get("mimeType"))
+                    if res.get("status") in ["indexed", "metadata_updated"]:
+                        logger.info(f"✅ Successfully processed: {item_name} (Status: {res.get('status')})")
                         total_indexed += 1
+                    elif res.get("status") == "unchanged":
+                        logger.info(f"⏭️ Skipping unchanged file: {item_name}")
+                    else:
+                        logger.warning(f"⚠️ Failed to index {item_name}: {res.get('error') or res.get('status')}")
                     total_found += 1
 
             if total_indexed > 0:
-                logger.info(f"🔄 Detected {total_indexed} changes in {folder_id}. Invalidating summary cache.")
+                logger.info(f"🔄 Detected {total_indexed} changes in {folder_id} tree. Invalidating local summary cache.")
                 self._summary_cache.pop(folder_id, None)
 
             self.vector_store.mark_folder_indexed(folder_id)
-            return {"status": "complete", "indexed": total_indexed, "total_files": total_found}
+            return {
+                "status": "complete", 
+                "indexed": total_indexed, 
+                "total_files": total_found,
+                "all_folder_ids": list(set(all_folder_ids))
+            }
         except Exception as e:
             logger.error(f"Folder ingest error: {e}")
-            return {"status": "error", "error": str(e)}
+            return {"status": "error", "error": str(e), "all_folder_ids": [folder_id]}
 
     async def query(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
         parsed = self.parser.parse(text)
@@ -247,22 +274,25 @@ class SummarizationPipeline:
             query_str = parsed.remaining_text if parsed.remaining_text else text
             return await self._answer_question(query_str, [], [], folder_id=None)
 
+        all_folder_ids = []
         for item in resolved_items:
             if item["type"] == "folder":
-                await self.ingest_folder(item["id"], access_token, refresh_token)
+                res = await self.ingest_folder(item["id"], access_token, refresh_token)
+                if "all_folder_ids" in res:
+                    all_folder_ids.extend(res["all_folder_ids"])
             elif not self.vector_store.is_file_indexed(item["id"]):
                 await self.ingest_file(item["id"], item["name"], access_token, refresh_token)
         
         main_item = resolved_items[0]
         if parsed.intent == Intent.SUMMARIZE:
             if main_item["type"] == "folder":
-                return await self._summarize_folder(main_item["id"], main_item["name"], access_token, refresh_token)
+                return await self._summarize_folder(main_item["id"], main_item["name"], access_token, refresh_token, all_folder_ids=all_folder_ids)
             return await self._summarize_file(main_item["id"], main_item["name"])
         
         all_ids = [it["id"] for it in resolved_items]
         all_names = [it["name"] for it in resolved_items]
-        folder_id = main_item["id"] if main_item["type"] == "folder" else None
-        return await self._answer_question(parsed.remaining_text, all_ids, all_names, folder_id=folder_id)
+        target_folders = all_folder_ids if main_item["type"] == "folder" else None
+        return await self._answer_question(parsed.remaining_text, all_ids, all_names, folder_id=target_folders)
 
     def _fuzzy_match_text_to_items(self, text: str, items: list) -> Optional[dict]:
         if not text or len(text) < 3: return None
@@ -331,13 +361,18 @@ class SummarizationPipeline:
             ans = self._local_extractive_summary(text, file_name)
         return {"type": "fallback", "answer": json.dumps(self._parse_llm_json(ans)), "sources": [{"file": file_name, "type": "fallback"}]}
 
-    async def _summarize_folder(self, folder_id: str, folder_name: str, access_token: str, refresh_token: str = None) -> dict:
+    async def _summarize_folder(self, folder_id: str, folder_name: str, access_token: str, refresh_token: str = None, all_folder_ids: Optional[List[str]] = None) -> dict:
         if folder_id in self._summary_cache: return self._summary_cache[folder_id]
         
+        ids_to_query = all_folder_ids if all_folder_ids else [folder_id]
+        where_filter = {"folder_id": folder_id} if len(ids_to_query) == 1 else {"folder_id": {"$in": ids_to_query}}
+
         # Get all chunks for the folder to ensure diverse representation
+        # We set a high limit (500) to ensure we don't miss any files in a large tree
         results = self.vector_store.collection.get(
-            where={"folder_id": folder_id},
-            include=["documents", "metadatas"]
+            where=where_filter,
+            include=["documents", "metadatas"],
+            limit=500
         )
         
         docs = results.get("documents", [])
@@ -353,14 +388,18 @@ class SummarizationPipeline:
             context = ""
             sources = set()
             
-            for fname, chunks in file_chunks.items():
+            # Sort files by name to ensure consistent summaries
+            sorted_files = sorted(file_chunks.keys())
+            for fname in sorted_files:
+                chunks = file_chunks[fname]
                 sources.add(fname)
                 context += f"--- {fname} ---\n"
+                # Take top 3 chunks per file for diversity
                 for text in chunks[:3]:
-                    if len(context) > 12000: # Safer limit for Cerebras 8k token context window
+                    if len(context) > 12000:
                         break
                     
-                    if "%PDF" in text[:100] or b"\x00" in text[:100].encode("utf-8", "ignore"):
+                    if "%PDF" in text[:100]:
                         context += "[Binary content redacted for stability]\n\n"
                         continue
                         
@@ -377,7 +416,7 @@ class SummarizationPipeline:
 
         return {"answer": f"Sparse index for {folder_name}.", "sources": []}
 
-    async def _answer_question(self, question: str, file_ids: List[str], file_names: List[str], folder_id: Optional[str] = None) -> dict:
+    async def _answer_question(self, question: str, file_ids: List[str], file_names: List[str], folder_id: Optional[Any] = None) -> dict:
         results = self.vector_store.query(question, file_ids=file_ids, folder_id=folder_id, top_k=10)
         if not results or not results.get("documents") or not results["documents"][0]:
             return {"answer": "No relevant content found.", "sources": []}

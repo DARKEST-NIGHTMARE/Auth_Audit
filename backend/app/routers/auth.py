@@ -197,10 +197,15 @@ async def google_login(
     }
 
 @router.post("/refresh")
-async def refresh_access_token(refresh_token: str = Cookie(None), db: AsyncSession = Depends(database.get_db)):
+async def refresh_access_token(request: Request, refresh_token: str = Cookie(None), db: AsyncSession = Depends(database.get_db)):
     """to be called when access token expires"""
+    logger.info("refresh_token_attempt", extra={
+        "has_cookie": refresh_token is not None,
+        "client": request.client.host if request.client else "unknown"
+    })
+    
     if not refresh_token:
-        raise HTTPException(status_code=401, detail = "Refresh token missing")
+        raise HTTPException(status_code=401, detail = "Refresh token missing from cookies")
     
     # Check if session is valid in DB
     session_stmt = select(models.UserSession).where(
@@ -211,8 +216,8 @@ async def refresh_access_token(refresh_token: str = Cookie(None), db: AsyncSessi
     active_session = session_res.scalars().first()
     
     if not active_session:
-        # Invalid or revoked session
-        raise HTTPException(status_code=401, detail="Session expired or revoked")
+        logger.warning("refresh_token_failed", extra={"reason": "session_not_found_or_inactive"})
+        raise HTTPException(status_code=401, detail="Session expired, revoked, or refresh token invalid")
     
     email = dependencies.verify_refresh_token(refresh_token)
     if not email:

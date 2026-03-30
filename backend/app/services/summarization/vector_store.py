@@ -3,7 +3,7 @@ import json
 import hashlib
 import re
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from app.logger import get_logger
 from .ai_clients import GeminiClient, LocalEmbeddingClient
 from .document_processor import Chunk
@@ -132,13 +132,19 @@ class VectorStoreManager:
             else:
                 raise
 
-    def query(self, query_text: str, file_ids: List[str] = None, folder_id: Optional[str] = None, top_k: int = 15) -> dict:
+    def query(self, query_text: str, file_ids: List[str] = None, folder_id: Optional[Union[str, List[str]]] = None, top_k: int = 15) -> dict:
         """Query similar chunks with optional file/folder filtering."""
         query_embedding = self.gemini.embed(query_text)
         
         where_filter = None
         if folder_id:
-            where_filter = {"folder_id": folder_id}
+            if isinstance(folder_id, list):
+                if len(folder_id) == 1:
+                    where_filter = {"folder_id": folder_id[0]}
+                else:
+                    where_filter = {"folder_id": {"$in": folder_id}}
+            else:
+                where_filter = {"folder_id": folder_id}
         elif file_ids:
             if len(file_ids) == 1:
                 where_filter = {"file_id": file_ids[0]}
@@ -154,13 +160,13 @@ class VectorStoreManager:
 
         if not results["documents"] or not results["documents"][0] or (results["distances"] and results["distances"][0][0] > 0.6):
             logger.info(f"Weak vector match for '{query_text}'. Triggering keyword fallback...")
-            keyword_results = self._keyword_search_fallback(query_text, where_filter, top_k=top_k)
+            keyword_results = self._keyword_search_fallback(query_text, query_embedding, where_filter, top_k=top_k)
             if keyword_results["documents"] and keyword_results["documents"][0]:
                 return keyword_results
 
         return results
 
-    def _keyword_search_fallback(self, query_text: str, where_filter: Optional[dict] = None, top_k: int = 10) -> dict:
+    def _keyword_search_fallback(self, query_text: str, query_embedding: List[float], where_filter: Optional[dict] = None, top_k: int = 10) -> dict:
         """Basic keyword fallback via ChromaDB where_document contains."""
         keywords = [w for w in re.findall(r'\w+', query_text) if len(w) > 3]
         if not keywords:
@@ -171,7 +177,7 @@ class VectorStoreManager:
 
         try:
             results = self.collection.query(
-                query_texts=[query_text],
+                query_embeddings=[query_embedding],
                 n_results=top_k,
                 where=where_filter,
                 where_document={"$contains": primary_keyword},
@@ -263,7 +269,29 @@ class VectorStoreManager:
         except Exception:
             return False
 
-    def get_file_metadata_from_index(self, file_id: str) -> Optional[Dict[str, Any]]:
+    def update_file_metadata(self, file_id: str, new_metadata: dict) -> bool:
+        """Update metadata for all chunks of a file without re-embedding."""
+        try:
+            results = self.collection.get(where={"file_id": file_id})
+            if not results or not results["ids"]:
+                return False
+            
+            ids = results["ids"]
+            old_metadatas = results["metadatas"]
+            
+            updated_metadatas = []
+            for m in old_metadatas:
+                m.update(new_metadata)
+                updated_metadatas.append(m)
+            
+            self.collection.update(ids=ids, metadatas=updated_metadatas)
+            logger.info(f"Updated metadata for file {file_id}: {new_metadata}")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating metadata for {file_id}: {e}")
+            return False
+
+    def get_file_metadata(self, file_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve stored metadata for a file to perform fast-skip checks."""
         try:
             res = self.collection.get(where={"file_id": file_id}, limit=1, include=["metadatas"])
