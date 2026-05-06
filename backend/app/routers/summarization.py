@@ -9,9 +9,10 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 from app.core.database import get_db
-from app.models import User
+from app.models import User, QueryJob, QueryJobStatus
 from app.core.dependencies import get_current_db_user
-from app.services.summarization_service import summarization_pipeline
+from app.services.summarization.pipeline import summarization_pipeline
+from app.core.task_manager import task_manager
 from app.services.google_drive_service import drive_service
 from app.logger import get_logger
 
@@ -25,10 +26,17 @@ router = APIRouter(prefix="/api/summarize", tags=["summarization"])
 class QueryRequest(BaseModel):
     text: str  # e.g. "summarize @FolderName"
 
-class QueryResponse(BaseModel):
-    answer: str
-    sources: list
-    intent: str = "summarize"
+class QueryJobResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+class QueryResultResponse(BaseModel):
+    job_id: str
+    status: str
+    answer: Optional[str] = None
+    sources: Optional[list] = None
+    error: Optional[str] = None
 
 class IngestResponse(BaseModel):
     status: str
@@ -43,43 +51,109 @@ class AutocompleteItem(BaseModel):
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
-@router.post("/query", response_model=QueryResponse)
+@router.post("/query", response_model=QueryJobResponse)
 async def handle_query(
     request: QueryRequest,
-    current_user: User = Depends(get_current_db_user)
+    current_user: User = Depends(get_current_db_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    Main query endpoint.
-    Accepts natural language with @mentions.
-    Example: "summarize @AuthAuditWorkspace"
+    Async query endpoint.
+    Retrieves context, enqueues a job, and returns job_id immediately.
     """
     if not current_user.google_drive_access_token:
-        raise HTTPException(status_code=400, detail="Google Drive not connected. Please connect first.")
+        raise HTTPException(status_code=400, detail="Google Drive not connected.")
 
     try:
-        # Get user's files/folders for @mention resolution
+        # 1. Resolve mentions and fetch context chunks (fast part)
         files_and_folders = drive_service.list_all_files(
             current_user.google_drive_access_token,
             current_user.google_drive_refresh_token
         )
 
-        # Run the pipeline
-        result = await summarization_pipeline.query(
+        context_package = await summarization_pipeline.get_query_context(
             text=request.text,
             folders=files_and_folders,
             access_token=current_user.google_drive_access_token,
             refresh_token=current_user.google_drive_refresh_token,
         )
 
-        return QueryResponse(
-            answer=result.get("answer", "No response generated."),
-            sources=result.get("sources", []),
-            intent=result.get("intent", "summarize"),
+        # 2. Check Cache / Existing completed jobs for SAME user/query
+        cache_key = context_package["cache_key"]
+        # (Optimization: We could check the DB for 'completed' jobs with this cache_key)
+        
+        # 3. Create Job in DB
+        import uuid
+        job_id = str(uuid.uuid4())
+        
+        new_job = QueryJob(
+            id=job_id,
+            user_id=current_user.id,
+            query=request.text,
+            status=QueryJobStatus.PENDING,
+            context_data=context_package
+        )
+        db.add(new_job)
+        await db.commit()
+
+        # 4. Enqueue for Worker
+        job_payload = {
+            "job_id": job_id,
+            "user_id": current_user.id,
+            "query": context_package["query"],
+            "chunks": context_package["chunks"]
+        }
+        await task_manager.enqueue_job(job_payload)
+
+        return QueryJobResponse(
+            job_id=job_id,
+            status="pending",
+            message="Your request has been enqueued. Please poll for results."
         )
 
     except Exception as e:
-        logger.error(f"Summarization query error: {e}")
-        raise HTTPException(status_code=500, detail=f"Summarization failed: {str(e)}")
+        logger.error(f"Async query enqueue error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue query: {str(e)}")
+
+@router.get("/result/{job_id}", response_model=QueryResultResponse)
+async def get_query_result(
+    job_id: str,
+    current_user: User = Depends(get_current_db_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Poll for the result of a specific summarization job."""
+    stmt = select(QueryJob).where(QueryJob.id == job_id, QueryJob.user_id == current_user.id)
+    res = await db.execute(stmt)
+    job = res.scalars().first()
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    import json
+    answer = None
+    sources = []
+    
+    if job.status == QueryJobStatus.COMPLETED and job.result:
+        try:
+            # result is JSON in DB
+            res_data = job.result
+            if isinstance(res_data, str):
+                res_data = json.loads(res_data)
+            
+            # The answer might be a stringified JSON (from our previous pipeline implementation)
+            answer = res_data.get("answer", "")
+            sources = res_data.get("sources", [])
+        except Exception as e:
+            logger.error(f"Error parsing job result for {job_id}: {e}")
+            answer = str(job.result)
+
+    return QueryResultResponse(
+        job_id=job_id,
+        status=job.status.value,
+        answer=answer,
+        sources=sources,
+        error=job.error
+    )
 
 
 @router.get("/autocomplete")

@@ -440,4 +440,101 @@ class SummarizationPipeline:
         ans = await self._generate_with_fallback(prompt, PromptBuilder.SYSTEM_INSTRUCTION, "Search", ctx[:1000])
         return {"answer": json.dumps(self._parse_llm_json(ans)), "sources": [{"file": f} for f in seen_files], "intent": "question"}
 
+    async def generate_summary_from_chunks(self, query: str, chunks: List[Dict[str, Any]]) -> dict:
+        """
+        Worker-side entry point: takes pre-resolved context and makes the LLM call.
+        """
+        if not chunks:
+            return {"answer": "No relevant content found.", "sources": []}
+
+        # Build context string
+        ctx = ""
+        seen_files = []
+        for chunk in chunks:
+            fname = chunk.get("file_name", "unknown")
+            if fname not in seen_files:
+                seen_files.append(fname)
+            ctx += f"[{fname}]: {chunk['document']}\n\n"
+            if len(ctx) > 12000:
+                break
+        
+        files_str = ", ".join(seen_files) if seen_files else "Knowledge Base"
+        
+        # Decide prompt based on query content (simple heuristic for now)
+        if "summarize" in query.lower() or len(seen_files) == 1:
+            prompt = self.prompt_builder.build_general_summary_prompt(files_str, ctx)
+            system = PromptBuilder.GENERAL_SYSTEM_INSTRUCTION
+        else:
+            prompt = self.prompt_builder.build_question_prompt(query, ctx, files_str)
+            system = PromptBuilder.SYSTEM_INSTRUCTION
+
+        ans_text = await self._generate_with_fallback(prompt, system, "AsyncJob", ctx[:1000])
+        parsed = self._parse_llm_json(ans_text)
+        
+        return {
+            "answer": json.dumps(parsed),
+            "sources": [{"file": f} for f in seen_files],
+            "intent": "summarize" if "summarize" in query.lower() else "question"
+        }
+
+    async def get_query_context(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
+        """
+        API-side entry point: resolves mentions, ingests if needed, and retrieves top 5 chunks.
+        Returns a 'Job Package' for the worker.
+        """
+        parsed = self.parser.parse(text)
+        resolved_items = []
+        if parsed.mentions:
+            for m in parsed.mentions:
+                matched = self._resolve_mention(m, folders)
+                if matched:
+                    resolved_items.append({"id": matched["id"], "name": matched["name"], "type": "folder" if matched["is_folder"] else "file"})
+
+        if not resolved_items:
+            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
+            if implicit:
+                resolved_items.append({"id": implicit["id"], "name": implicit["name"], "type": "folder" if implicit["is_folder"] else "file"})
+
+        # Ingest missing items
+        all_folder_ids = []
+        for item in resolved_items:
+            if item["type"] == "folder":
+                res = await self.ingest_folder(item["id"], access_token, refresh_token)
+                if "all_folder_ids" in res:
+                    all_folder_ids.extend(res["all_folder_ids"])
+            elif not self.vector_store.is_file_indexed(item["id"]):
+                await self.ingest_file(item["id"], item["name"], access_token, refresh_token)
+
+        main_item = resolved_items[0] if resolved_items else None
+        target_file_ids = [item["id"] for item in resolved_items if item["type"] == "file"]
+        target_folder_ids = all_folder_ids if (main_item and main_item["type"] == "folder") else None
+        
+        query_str = parsed.remaining_text if parsed.remaining_text else text
+        
+        # Retrieve context (Top 5 relevant chunks as requested)
+        results = self.vector_store.query(
+            query_str, 
+            file_ids=target_file_ids if target_file_ids else None, 
+            folder_id=target_folder_ids if target_folder_ids else None, 
+            top_k=5
+        )
+        
+        chunks = []
+        if results and results.get("documents") and results["documents"][0]:
+            docs = results["documents"][0]
+            metas = results["metadatas"][0]
+            for d, m in zip(docs, metas):
+                chunks.append({
+                    "document": d,
+                    "file_name": m.get("file_name", "unknown"),
+                    "file_id": m.get("file_id", "unknown")
+                })
+
+        return {
+            "query": query_str,
+            "chunks": chunks,
+            "resolved_items": resolved_items,
+            "cache_key": hashlib.md5(f"{query_str}:{target_file_ids}:{target_folder_ids}".encode()).hexdigest()
+        }
+
 summarization_pipeline = SummarizationPipeline()

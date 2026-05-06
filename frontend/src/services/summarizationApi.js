@@ -25,4 +25,9 @@ export const summarizationApi = {
         const response = await api.get("/api/summarize/status");
         return response.data;
     },
+
+    getResult: async (jobId) => {
+        const response = await api.get(`/api/summarize/result/${jobId}`);
+        return response.data;
+    },
 };

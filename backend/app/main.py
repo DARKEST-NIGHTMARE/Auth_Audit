@@ -1,5 +1,6 @@
 import time
 import os
+import asyncio
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 import httpx
 from fastapi import FastAPI, Request, Response, status
@@ -57,6 +58,30 @@ async def startup():
     os.makedirs("static/profiles", exist_ok=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Start the background summarization worker
+    from .services.summarization.worker import worker_loop
+    asyncio.create_task(worker_loop())
+
+    # Start the periodic cleanup task (every hour)
+    async def cleanup_loop():
+        from sqlalchemy import delete
+        from datetime import datetime, timedelta, timezone
+        from .models import QueryJob
+        while True:
+            try:
+                async with engine.begin() as conn:
+                    # Delete jobs older than 24 hours
+                    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+                    await conn.execute(
+                        delete(QueryJob).where(QueryJob.created_at < cutoff)
+                    )
+                logger.info("Cleanup task: Removed jobs older than 24h.")
+            except Exception as e:
+                logger.error(f"Cleanup task error: {e}")
+            await asyncio.sleep(3600) # Wait 1 hour
+            
+    asyncio.create_task(cleanup_loop())
 
     logger.info("application_startup", extra={"env": "development"})
 

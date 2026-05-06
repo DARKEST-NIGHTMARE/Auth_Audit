@@ -93,3 +93,30 @@ class OTPCode(Base):
     code = Column(String(6), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     user = relationship("User", backref="otp_codes")
+
+class QueryJobStatus(str, enum.Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class QueryJob(Base):
+    __tablename__ = "query_jobs"
+    id = Column(String, primary_key=True, index=True) # UUID string
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    
+    query = Column(String, nullable=False)
+    source = Column(String, nullable=True) # "google_drive" or "local"
+    status = Column(Enum(QueryJobStatus), default=QueryJobStatus.PENDING)
+    
+    result = Column(JSON, nullable=True) # The final AI response structure
+    error = Column(String, nullable=True)
+    
+    # Context for the worker (serialized)
+    context_data = Column(JSON, nullable=True) 
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    is_active = Column(Boolean, default=True) # For 24h cleanup
+
+    user = relationship("User", backref="query_jobs")

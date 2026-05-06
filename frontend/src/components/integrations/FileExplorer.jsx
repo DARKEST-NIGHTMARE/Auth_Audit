@@ -4,7 +4,7 @@ import { summarizationApi } from "../../services/summarizationApi";
 
 const AssistantSuggestions = ({ questions, onQuery, loading, contextFile }) => {
     const [showAll, setShowAll] = useState(false);
-    
+
     useEffect(() => {
         const styleId = "gemini-suggestions-style";
         if (!document.getElementById(styleId)) {
@@ -38,8 +38,8 @@ const AssistantSuggestions = ({ questions, onQuery, loading, contextFile }) => {
     const displayedQuestions = showAll ? questions : questions.slice(0, 3);
 
     return (
-        <div style={{ 
-            marginTop: "1.5rem", 
+        <div style={{
+            marginTop: "1.5rem",
             marginBottom: "1rem",
             display: "flex",
             flexDirection: "column",
@@ -48,50 +48,50 @@ const AssistantSuggestions = ({ questions, onQuery, loading, contextFile }) => {
             {displayedQuestions.map((q, idx) => {
                 const questionText = typeof q === "string" ? q : (q?.text || q?.question || JSON.stringify(q) || "");
                 return (
-                <button 
-                    key={idx} 
-                    className="gemini-suggestion"
-                    type="button"
-                    onClick={(e) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        if (!loading && questionText) onQuery(questionText, contextFile);
-                    }}
-                    disabled={loading}
-                    style={{
-                        textAlign: "left",
-                        padding: "10px 12px",
-                        color: "#E2E8F0",
-                        borderRadius: "8px",
-                        cursor: loading ? "wait" : "pointer",
-                        fontSize: "0.9rem",
-                        display: "flex",
-                        alignItems: "flex-start",
-                        gap: "14px",
-                        width: "100%",
-                        lineHeight: "1.5",
-                        opacity: loading ? 0.6 : 1,
-                        pointerEvents: "auto",
-                        position: "relative",
-                        zIndex: 10
-                    }}
-                >
-                    <span style={{ 
-                        color: "#94A3B8", 
-                        fontSize: "1.2rem", 
-                        marginTop: "2px",
-                        display: "inline-block",
-                        transform: "scaleX(-1)"
-                    }}>
-                        ↳
-                    </span>
-                    <span style={{ flex: 1 }}>{questionText}</span>
-                </button>
+                    <button
+                        key={idx}
+                        className="gemini-suggestion"
+                        type="button"
+                        onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            if (!loading && questionText) onQuery(questionText, contextFile);
+                        }}
+                        disabled={loading}
+                        style={{
+                            textAlign: "left",
+                            padding: "10px 12px",
+                            color: "#E2E8F0",
+                            borderRadius: "8px",
+                            cursor: loading ? "wait" : "pointer",
+                            fontSize: "0.9rem",
+                            display: "flex",
+                            alignItems: "flex-start",
+                            gap: "14px",
+                            width: "100%",
+                            lineHeight: "1.5",
+                            opacity: loading ? 0.6 : 1,
+                            pointerEvents: "auto",
+                            position: "relative",
+                            zIndex: 10
+                        }}
+                    >
+                        <span style={{
+                            color: "#94A3B8",
+                            fontSize: "1.2rem",
+                            marginTop: "2px",
+                            display: "inline-block",
+                            transform: "scaleX(-1)"
+                        }}>
+                            ↳
+                        </span>
+                        <span style={{ flex: 1 }}>{questionText}</span>
+                    </button>
                 );
             })}
-            
+
             {questions.length > 3 && (
-                <button 
+                <button
                     className="gemini-suggestion-toggle"
                     type="button"
                     onClick={() => setShowAll(!showAll)}
@@ -129,7 +129,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
     const inputRef = useRef(null);
 
     useEffect(() => {
-        summarizationApi.getStatus().catch(() => {});
+        summarizationApi.getStatus().catch(() => { });
     }, []);
 
     // Auto-scroll to bottom
@@ -156,8 +156,8 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                 const results = await summarizationApi.autocomplete(atMatch[1]);
                 setSuggestions(results);
                 setShowSuggestions(results.length > 0);
-            } catch { 
-                setSuggestions([]); 
+            } catch {
+                setSuggestions([]);
                 setShowSuggestions(false);
             }
         } else {
@@ -193,19 +193,53 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         }
         setShowSuggestions(false);
         setSuggestions([]);
-        
-        setMessages(prev => [...prev, { role: "user", content: userMsg }]);
+        setInput(""); 
+
+        const userMsgId = Date.now();
+        setMessages(prev => [...prev, { id: userMsgId, role: "user", content: userMsg }]);
         setLoading(true);
 
         try {
-            const response = await summarizationApi.query(userMsg);
+            // 1. Submit Query (Asynchronous Receipt)
+            const enqueueRes = await summarizationApi.query(userMsg);
+            const jobId = enqueueRes.job_id;
+
+            // 2. Add placeholder message for assistant
+            const assistantMsgId = userMsgId + 1;
             setMessages(prev => [...prev, {
+                id: assistantMsgId,
                 role: "assistant",
-                content: response.answer,
-                sources: response.sources,
-                intent: response.intent,
-                type: response.type,
+                content: "⏳ *Processing your request...*",
+                sources: []
             }]);
+
+            // 3. Polling Loop
+            let attempts = 0;
+            const maxAttempts = 90; // 3 minutes total polling
+            while (attempts < maxAttempts) {
+                const result = await summarizationApi.getResult(jobId);
+                
+                if (result.status === "completed") {
+                    setMessages(prev => prev.map(m => m.id === assistantMsgId ? {
+                        ...m,
+                        content: result.answer,
+                        sources: result.sources || [],
+                        type: result.type || "general_document"
+                    } : m));
+                    break;
+                } else if (result.status === "failed") {
+                    throw new Error(result.error || "Generation failed.");
+                }
+
+                // Wait 2 seconds before next poll
+                await new Promise(r => setTimeout(r, 2000));
+                attempts++;
+            }
+
+            if (attempts >= maxAttempts) {
+                throw new Error("Request timed out. The worker is busy, but your request will continue processing in the background.");
+            }
+
         } catch (err) {
             const detail = err?.response?.data?.detail || err.message || "Something went wrong.";
             setMessages(prev => [...prev, {
@@ -245,14 +279,14 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
     const renderAssistantContent = (msg) => {
         const isLegal = msg.type === "legal_case";
         const rawContent = msg.content || "";
-        
+
         let summary = "";
         let questionsList = [];
 
         // Logic for extracting content from potentially messy LLM output
         const cleanAndExtract = (text) => {
             if (!text) return { summary: "", questions: [] };
-            
+
             // 0. Handle direct error strings from the API catch block
             if (typeof text === "string" && text.trim().startsWith("❌")) {
                 return {
@@ -260,7 +294,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                     questions: []
                 };
             }
-            
+
             // 1. If it's already an object, use it directly
             if (typeof text === "object") {
                 return {
@@ -274,7 +308,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                 let jsonStr = text.trim();
                 // Strip markdown code blocks
                 jsonStr = jsonStr.replace(/```json\s?([\s\S]*?)```/g, "$1").trim();
-                
+
                 // If it doesn't start with { but contains a { ... } block
                 if (!jsonStr.startsWith("{")) {
                     const firstBrace = jsonStr.indexOf("{");
@@ -292,11 +326,11 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
             } catch (err) {
                 // 3. Fallback: Aggressive Regex for messy / leaking JSON
                 // Match the content inside "summary": "..."
-                const summaryMatch = text.match(/"summary":\s*"(.*?)"(?=,\s*"|}|\])/s) || 
-                                   text.match(/"summary":\s*([\s\S]*?)(?=,\s*"suggested|$)/s);
-                
+                const summaryMatch = text.match(/"summary":\s*"(.*?)"(?=,\s*"|}|\])/s) ||
+                    text.match(/"summary":\s*([\s\S]*?)(?=,\s*"suggested|$)/s);
+
                 let extractedSummary = summaryMatch ? summaryMatch[1] : text;
-                
+
                 // Clean up technical artifacts if the regex fallback was hit
                 extractedSummary = extractedSummary
                     .replace(/^[\s\n{"]+/, "")
@@ -331,11 +365,11 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
 
         return (
             <>
-                <div style={{ 
-                    fontSize: "0.7rem", 
-                    color: isLegal ? "#f6ad55" : "#667eea", 
-                    fontWeight: "bold", 
-                    marginBottom: msg.type ? "12px" : "8px", 
+                <div style={{
+                    fontSize: "0.7rem",
+                    color: isLegal ? "#f6ad55" : "#667eea",
+                    fontWeight: "bold",
+                    marginBottom: msg.type ? "12px" : "8px",
                     textTransform: "uppercase",
                     display: "flex",
                     alignItems: "center",
@@ -344,11 +378,11 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                 }}>
                     {isLegal ? "⚖️ Legal Case Analysis" : msg.type === "general_document" ? "📄 General Document Analysis" : "🤖 AI Response"}
                     {msg.type && (
-                        <span style={{ 
-                            fontSize: "0.6rem", 
-                            background: isLegal ? "rgba(246, 173, 85, 0.1)" : "rgba(102, 126, 234, 0.1)", 
-                            padding: "2px 8px", 
-                            borderRadius: "12px", 
+                        <span style={{
+                            fontSize: "0.6rem",
+                            background: isLegal ? "rgba(246, 173, 85, 0.1)" : "rgba(102, 126, 234, 0.1)",
+                            padding: "2px 8px",
+                            borderRadius: "12px",
                             marginLeft: "auto",
                             border: `1px solid ${isLegal ? "rgba(246, 173, 85, 0.3)" : "rgba(102, 126, 234, 0.3)"}`
                         }}>
@@ -356,26 +390,26 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                         </span>
                     )}
                 </div>
-                
-                <div className="markdown-content" style={{ 
-                    color: "#E2E8F0", 
+
+                <div className="markdown-content" style={{
+                    color: "#E2E8F0",
                     lineHeight: 1.75,
                     fontSize: "0.95rem"
                 }}>
-                    <ReactMarkdown 
+                    <ReactMarkdown
                         components={{
-                            p: ({node, ...props}) => <p style={{ margin: "0 0 1rem 0" }} {...props} />,
-                            h1: ({node, ...props}) => <h1 style={{ color: "#F7FAFC", fontSize: "1.2rem", margin: "1.5rem 0 0.8rem 0", borderBottom: "1px solid rgba(255,255,255,0.1)", paddingBottom: "4px" }} {...props} />,
-                            h2: ({node, ...props}) => <h2 style={{ color: "#F7FAFC", fontSize: "1.1rem", margin: "1.2rem 0 0.6rem 0" }} {...props} />,
-                            h3: ({node, ...props}) => <h3 style={{ color: "#F7FAFC", fontSize: "1rem", margin: "1rem 0 0.5rem 0" }} {...props} />,
-                            strong: ({node, ...props}) => <strong style={{ color: "#667eea", fontWeight: "600" }} {...props} />,
-                            ul: ({node, ...props}) => <ul style={{ paddingLeft: "1.2rem", margin: "0.5rem 0 1rem 0" }} {...props} />,
-                            li: ({node, ...props}) => <li style={{ marginBottom: "0.4rem" }} {...props} />,
-                            code: ({node, inline, ...props}) => (
-                                <code style={{ 
-                                    background: "rgba(102,126,234,0.15)", 
-                                    padding: "2px 5px", 
-                                    borderRadius: "4px", 
+                            p: ({ node, ...props }) => <p style={{ margin: "0 0 1rem 0" }} {...props} />,
+                            h1: ({ node, ...props }) => <h1 style={{ color: "#F7FAFC", fontSize: "1.2rem", margin: "1.5rem 0 0.8rem 0", borderBottom: "1px solid rgba(255,255,255,0.1)", paddingBottom: "4px" }} {...props} />,
+                            h2: ({ node, ...props }) => <h2 style={{ color: "#F7FAFC", fontSize: "1.1rem", margin: "1.2rem 0 0.6rem 0" }} {...props} />,
+                            h3: ({ node, ...props }) => <h3 style={{ color: "#F7FAFC", fontSize: "1rem", margin: "1rem 0 0.5rem 0" }} {...props} />,
+                            strong: ({ node, ...props }) => <strong style={{ color: "#667eea", fontWeight: "600" }} {...props} />,
+                            ul: ({ node, ...props }) => <ul style={{ paddingLeft: "1.2rem", margin: "0.5rem 0 1rem 0" }} {...props} />,
+                            li: ({ node, ...props }) => <li style={{ marginBottom: "0.4rem" }} {...props} />,
+                            code: ({ node, inline, ...props }) => (
+                                <code style={{
+                                    background: "rgba(102,126,234,0.15)",
+                                    padding: "2px 5px",
+                                    borderRadius: "4px",
                                     fontSize: "0.85rem",
                                     fontFamily: "monospace"
                                 }} {...props} />
@@ -386,9 +420,9 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                     </ReactMarkdown>
                 </div>
 
-                <AssistantSuggestions 
-                    questions={questionsList} 
-                    onQuery={(q, cf) => handleSend(q, cf)} 
+                <AssistantSuggestions
+                    questions={questionsList}
+                    onQuery={(q, cf) => handleSend(q, cf)}
                     loading={loading}
                     contextFile={msg.sources && msg.sources.length > 0 ? msg.sources[0].file : null}
                 />
@@ -523,8 +557,8 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
                                 borderBottom: "1px solid rgba(255,255,255,0.04)", transition: "background 0.15s",
                                 color: "#E2E8F0", fontSize: "0.85rem"
                             }}
-                            onMouseOver={e => e.currentTarget.style.background = "rgba(102,126,234,0.1)"}
-                            onMouseOut={e => e.currentTarget.style.background = "transparent"}
+                                onMouseOver={e => e.currentTarget.style.background = "rgba(102,126,234,0.1)"}
+                                onMouseOut={e => e.currentTarget.style.background = "transparent"}
                             >
                                 <span>{item.type === "folder" ? "📁" : "📄"}</span>
                                 <span>{item.name}</span>
