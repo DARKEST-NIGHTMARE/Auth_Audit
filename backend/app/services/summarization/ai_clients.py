@@ -3,6 +3,16 @@ import json
 import httpx
 import asyncio
 from typing import List, Optional
+try:
+    from langsmith import traceable
+    print("✅ [DEBUG] LangSmith: Module found. Tracing is active.")
+except ImportError:
+    def traceable(name=None, run_type=None, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    print("❌ [DEBUG] LangSmith: Module NOT found. Using no-op fallback.")
+
 from app.core.config import settings
 from app.logger import get_logger
 
@@ -15,6 +25,7 @@ class CerebrasClient:
         self.api_key = settings.cerebras_api_key
         self.api_url = "https://api.cerebras.ai/v1/chat/completions"
 
+    @traceable(name="Cerebras Generation", run_type="llm")
     async def generate(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         """Generate text using direct HTTP POST to Cerebras."""
         if not self.api_key:
@@ -59,6 +70,7 @@ class GeminiClient:
         self.embed_model = "models/gemini-embedding-001" 
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
 
+    @traceable(name="Gemini Generation", run_type="llm")
     async def generate(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         """Generate text utilizing Google Gemini API directly."""
         if not self.api_key:
@@ -111,6 +123,7 @@ class GeminiClient:
             logger.error(f"Gemini embedding batch error: {e}")
             return []
 
+@traceable(name="Summarization Task", run_type="chain")
 async def generate_text(prompt: str, system_instruction: Optional[str] = None) -> str:
     """Routes text generation tasks specifically to Cerebras (Exclusive)."""
     if not settings.cerebras_api_key:

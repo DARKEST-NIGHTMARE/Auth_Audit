@@ -1,8 +1,11 @@
 import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from dotenv import load_dotenv
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_FILE_PATH, override=True)
 
 class Settings(BaseSettings):
     
@@ -31,6 +34,12 @@ class Settings(BaseSettings):
     cerebras_api_key: str = ""
     generation_provider: str = "cerebras"  # "gemini" or "cerebras"
     cerebras_model: str = "llama3.1-8b"
+    
+    # LangSmith Observability
+    langchain_tracing_v2: bool = False
+    langchain_endpoint: str = "https://api.smith.langchain.com"
+    langchain_api_key: str = ""
+    langchain_project: str = "Login Auth Audit"
     
     # class Coonfig:
     #     # env_file = ".env"

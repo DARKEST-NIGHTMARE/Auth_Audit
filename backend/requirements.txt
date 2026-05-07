@@ -43,4 +43,5 @@ chromadb
 pdfplumber
 python-docx
 rapidfuzz
+langsmith
 cerebras-cloud-sdk

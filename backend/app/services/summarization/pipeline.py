@@ -4,6 +4,16 @@ import asyncio
 import hashlib
 import re
 from typing import List, Optional, Dict, Any
+try:
+    from langsmith import traceable
+    print("✅ [DEBUG] LangSmith: Pipeline tracing active.")
+except ImportError:
+    def traceable(name=None, run_type=None, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    print("❌ [DEBUG] LangSmith: Pipeline tracing inactive (module missing).")
+
 from app.logger import get_logger
 from .ai_clients import GeminiClient, generate_text
 from .document_processor import DocumentChunker, DocumentExtractor, DocumentType
@@ -143,6 +153,7 @@ class SummarizationPipeline:
             ctx += f"{doc}\n\n"
         return ctx
 
+    @traceable(name="Ingest File", run_type="tool")
     async def ingest_file(self, file_id: str, file_name: str, access_token: str, refresh_token: str = None, folder_id: Optional[str] = None, drive_modified: Optional[str] = None, mime_type: Optional[str] = None) -> dict:
         try:
             from app.services.google_drive_service import drive_service
@@ -187,6 +198,7 @@ class SummarizationPipeline:
             logger.error(f"Ingest failure for {file_id}: {e}")
             return {"status": "error", "error": str(e)}
 
+    @traceable(name="Ingest Folder", run_type="tool")
     async def ingest_folder(self, folder_id: str, access_token: str, refresh_token: str = None) -> dict:
         from app.services.google_drive_service import drive_service
         try:
@@ -256,6 +268,7 @@ class SummarizationPipeline:
             logger.error(f"Folder ingest error: {e}")
             return {"status": "error", "error": str(e), "all_folder_ids": [folder_id]}
 
+    @traceable(name="Pipeline Query (Sync)", run_type="chain")
     async def query(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
         parsed = self.parser.parse(text)
         resolved_items = []
@@ -440,6 +453,7 @@ class SummarizationPipeline:
         ans = await self._generate_with_fallback(prompt, PromptBuilder.SYSTEM_INSTRUCTION, "Search", ctx[:1000])
         return {"answer": json.dumps(self._parse_llm_json(ans)), "sources": [{"file": f} for f in seen_files], "intent": "question"}
 
+    @traceable(name="Worker Execution", run_type="chain")
     async def generate_summary_from_chunks(self, query: str, chunks: List[Dict[str, Any]]) -> dict:
         """
         Worker-side entry point: takes pre-resolved context and makes the LLM call.
@@ -477,6 +491,7 @@ class SummarizationPipeline:
             "intent": "summarize" if "summarize" in query.lower() else "question"
         }
 
+    @traceable(name="Resolve Context", run_type="chain")
     async def get_query_context(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
         """
         API-side entry point: resolves mentions, ingests if needed, and retrieves top 5 chunks.
