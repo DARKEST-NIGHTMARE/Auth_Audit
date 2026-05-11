@@ -35,14 +35,16 @@ class GoogleDriveService:
             }
         }
 
-    def get_auth_url(self):
+    def get_auth_url(self, redirect_uri: str = None):
         """Generates Google Auth URL manually to avoid PKCE 'code_verifier' issues."""
         try:
             from urllib.parse import urlencode
             
+            final_redirect_uri = redirect_uri or settings.google_drive_redirect_uri
+            
             params = {
                 "client_id": settings.google_client_id,
-                "redirect_uri": settings.google_drive_redirect_uri,
+                "redirect_uri": final_redirect_uri,
                 "response_type": "code",
                 "scope": " ".join(SCOPES),
                 "access_type": "offline",
@@ -58,19 +60,20 @@ class GoogleDriveService:
             logger.error(f"Error generating Drive Auth URL: {e}")
             raise HTTPException(status_code=500, detail="Failed to initiate Google Drive linking")
 
-    async def exchange_code(self, code: str):
+    async def exchange_code(self, code: str, redirect_uri: str = None):
         """Exchanges authorization code for access and refresh tokens manually."""
         try:
             import httpx
-            
+
+            final_redirect_uri = redirect_uri or settings.google_drive_redirect_uri
+
             data = {
                 "code": code,
                 "client_id": settings.google_client_id,
                 "client_secret": settings.google_client_secret,
-                "redirect_uri": settings.google_drive_redirect_uri,
+                "redirect_uri": final_redirect_uri,
                 "grant_type": "authorization_code",
             }
-            
             async with httpx.AsyncClient() as client:
                 response = await client.post("https://oauth2.googleapis.com/token", data=data)
                 
@@ -101,14 +104,14 @@ class GoogleDriveService:
             
         return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-    def list_folders(self, access_token: str, refresh_token: Optional[str] = None):
+    def list_folders(self, access_token: str, refresh_token: Optional[str] = None, parent_id: str = "root"):
         try:
             service = self.get_client(access_token, refresh_token)
             results = service.files().list(
-                q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+                q=f"'{parent_id}' in parents and trashed=false",
                 pageSize=100,
-                fields="nextPageToken, files(id, name, createdTime, modifiedTime, parents)",
-                orderBy="name",
+                fields="nextPageToken, files(id, name, mimeType, createdTime, modifiedTime, parents)",
+                orderBy="folder, name",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True
             ).execute()

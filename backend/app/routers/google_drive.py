@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
@@ -22,6 +22,7 @@ async def get_db_user(payload: dict = Depends(get_current_user), db: AsyncSessio
 
 class DriveCodeRequest(BaseModel):
     code: str
+    redirect_uri: str | None = None
 
 class DriveItemCreate(BaseModel):
     name: str
@@ -29,8 +30,7 @@ class DriveItemCreate(BaseModel):
     parent_id: str | None = None
 
     class Config:
-        extra = "ignore" 
-
+        extra = "ignore"
 @router.post("/create-folder")
 async def create_folder(item: DriveItemCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_db_user)):
     if not current_user.google_drive_access_token:
@@ -91,8 +91,8 @@ async def upload_file(
     return uploaded_file
 
 @router.get("/auth-url")
-async def get_drive_auth_url(current_user: User = Depends(get_db_user)):
-    url = drive_service.get_auth_url()
+async def get_drive_auth_url(redirect_uri: str = Query(None), current_user: User = Depends(get_db_user)):
+    url = drive_service.get_auth_url(redirect_uri=redirect_uri)
     return {"url": url}
 
 @router.post("/callback")
@@ -102,9 +102,10 @@ async def drive_callback(
     current_user: User = Depends(get_db_user)
 ):
     """Exchanges code for tokens and saves them to the current user."""
-    tokens = await drive_service.exchange_code(request.code)
-    
+    tokens = await drive_service.exchange_code(request.code, request.redirect_uri)
+
     current_user.google_drive_access_token = tokens["access_token"]
+
     if tokens.get("refresh_token"):
         current_user.google_drive_refresh_token = tokens["refresh_token"]
         
@@ -130,13 +131,14 @@ async def disconnect_drive(
     return {"status": "success", "message": "Google Drive disconnected."}
 
 @router.get("/folders")
-async def get_folders(current_user: User = Depends(get_db_user)):
+async def get_folders(parent_id: str = Query("root"), current_user: User = Depends(get_db_user)):
     if not current_user.google_drive_access_token:
         raise HTTPException(status_code=400, detail="Google Drive is not connected")
         
     folders = drive_service.list_folders(
         access_token=current_user.google_drive_access_token,
-        refresh_token=current_user.google_drive_refresh_token
+        refresh_token=current_user.google_drive_refresh_token,
+        parent_id=parent_id
     )
     return folders
 

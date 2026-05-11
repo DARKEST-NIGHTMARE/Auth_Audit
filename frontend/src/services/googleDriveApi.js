@@ -2,12 +2,14 @@ import api from "./api";
 
 export const googleDriveApi = {
     getAuthUrl: async () => {
-        const response = await api.get("/api/drive/auth-url");
+        const redirectUri = window.location.origin + "/drive/callback";
+        const response = await api.get(`/api/drive/auth-url?redirect_uri=${encodeURIComponent(redirectUri)}`);
         return response.data;
     },
 
     connectDrive: async (code) => {
-        const response = await api.post("/api/drive/callback", { code });
+        const redirectUri = window.location.origin + "/drive/callback";
+        const response = await api.post("/api/drive/callback", { code, redirect_uri: redirectUri });
         return response.data;
     },
 

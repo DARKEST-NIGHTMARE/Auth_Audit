@@ -1,4 +1,5 @@
 import random
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -81,14 +82,43 @@ class AuthService:
         user_info_res.raise_for_status() # Raise an exception for bad status codes
         return user_info_res.json()
 
-    async def authenticate_google(self, code: str, client_ip: str, location_str: str, location_source: str, lat: float, lon: float, device_info: str):
-        google_tokens = await self._get_google_tokens(code)
-        access_token = google_tokens.get("access_token")
+    async def authenticate_google(self, code: Optional[str], id_token: Optional[str], access_token: Optional[str], client_ip: str, location_str: str, location_source: str, lat: float, lon: float, device_info: str):
+        email, name, picture = None, None, None
+
+        if id_token:
+            try:
+                # Verify id_token
+                id_info = google_id_token.verify_oauth2_token(
+                    id_token, google_requests.Request(), settings.google_client_id
+                )
+                email = id_info.get("email")
+                name = id_info.get("name")
+                picture = id_info.get("picture")
+            except Exception as e:
+                if not access_token:
+                    raise HTTPException(status_code=401, detail=f"Invalid Google ID Token: {str(e)}")
+                # If id_token fails but we have access_token, we'll try that next
         
-        user_info = await self._get_google_user_info(access_token)
-        email = user_info.get("email")
-        name = user_info.get("name")
-        picture = user_info.get("picture")
+        if not email and access_token:
+            # Fallback to verify via access_token by calling userinfo endpoint
+            try:
+                user_info = await self._get_google_user_info(access_token)
+                email = user_info.get("email")
+                name = user_info.get("name")
+                picture = user_info.get("picture")
+            except Exception as e:
+                raise HTTPException(status_code=401, detail=f"Invalid Google Access Token: {str(e)}")
+
+        if not email and code:
+            google_tokens = await self._get_google_tokens(code)
+            access_token = google_tokens.get("access_token")
+            user_info = await self._get_google_user_info(access_token)
+            email = user_info.get("email")
+            name = user_info.get("name")
+            picture = user_info.get("picture")
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="Either code, id_token, or access_token must be provided and valid")
 
         db_user = await self.user_repo.get_by_email(email)
         if not db_user:

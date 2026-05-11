@@ -4,7 +4,9 @@ from datetime import datetime
 from .models import EventType, UserRole
 
 class GoogleLoginRequest(BaseModel):
-    code: str
+    code: Optional[str] = None
+    id_token: Optional[str] = None
+    access_token: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 

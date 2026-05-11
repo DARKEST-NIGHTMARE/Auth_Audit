@@ -169,6 +169,8 @@ async def google_login(
     auth_service = AuthService(db, http_client)
     access_token, refresh_token, user = await auth_service.authenticate_google(
         code=payload.code,
+        id_token=payload.id_token,
+        access_token=payload.access_token,
         client_ip=client_ip,
         location_str=location_str,
         location_source=location_source,
