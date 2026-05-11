@@ -38,6 +38,14 @@ class QueryResultResponse(BaseModel):
     sources: Optional[list] = None
     error: Optional[str] = None
 
+class ChatHistoryItem(BaseModel):
+    job_id: str
+    query: str
+    status: str
+    answer: Optional[str] = None
+    sources: Optional[list] = None
+    created_at: str
+
 class IngestResponse(BaseModel):
     status: str
     message: str = ""
@@ -154,6 +162,45 @@ async def get_query_result(
         sources=sources,
         error=job.error
     )
+
+
+@router.get("/history", response_model=List[ChatHistoryItem])
+async def get_chat_history(
+    limit: int = 50,
+    current_user: User = Depends(get_current_db_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Fetch the user's recent AI chat history."""
+    stmt = select(QueryJob).where(
+        QueryJob.user_id == current_user.id
+    ).order_by(QueryJob.created_at.asc()).limit(limit)
+    res = await db.execute(stmt)
+    jobs = res.scalars().all()
+    
+    history = []
+    import json
+    for job in jobs:
+        answer = None
+        sources = []
+        if job.status == QueryJobStatus.COMPLETED and job.result:
+            try:
+                res_data = job.result
+                if isinstance(res_data, str):
+                    res_data = json.loads(res_data)
+                answer = res_data.get("answer", "")
+                sources = res_data.get("sources", [])
+            except Exception as e:
+                answer = str(job.result)
+        
+        history.append(ChatHistoryItem(
+            job_id=job.id,
+            query=job.query,
+            status=job.status.value,
+            answer=answer,
+            sources=sources,
+            created_at=job.created_at.isoformat() if job.created_at else ""
+        ))
+    return history
 
 
 @router.get("/autocomplete")

@@ -130,6 +130,42 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
 
     useEffect(() => {
         summarizationApi.getStatus().catch(() => { });
+        
+        // Fetch chat history
+        const fetchHistory = async () => {
+            try {
+                const history = await summarizationApi.getHistory();
+                if (history && history.length > 0) {
+                    const formattedHistory = [];
+                    history.forEach((item, index) => {
+                        formattedHistory.push({
+                            id: `history-${index}-user`,
+                            role: "user",
+                            content: item.query
+                        });
+                        if (item.status === "completed" && item.answer) {
+                            formattedHistory.push({
+                                id: `history-${index}-assistant`,
+                                role: "assistant",
+                                content: item.answer,
+                                sources: item.sources || []
+                            });
+                        } else if (item.status === "failed") {
+                            formattedHistory.push({
+                                id: `history-${index}-assistant`,
+                                role: "assistant",
+                                content: "❌ *Error during previous job.*",
+                                sources: []
+                            });
+                        }
+                    });
+                    setMessages(formattedHistory);
+                }
+            } catch (err) {
+                console.error("Failed to fetch chat history:", err);
+            }
+        };
+        fetchHistory();
     }, []);
 
     // Auto-scroll to bottom

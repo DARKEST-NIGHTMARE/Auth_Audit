@@ -30,4 +30,9 @@ export const summarizationApi = {
         const response = await api.get(`/api/summarize/result/${jobId}`);
         return response.data;
     },
+
+    getHistory: async (limit = 50) => {
+        const response = await api.get(`/api/summarize/history?limit=${limit}`);
+        return response.data;
+    },
 };
