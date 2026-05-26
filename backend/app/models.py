@@ -99,6 +99,7 @@ class QueryJobStatus(str, enum.Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    AWAITING_APPROVAL = "awaiting_approval"  # Human-in-the-loop: Drive write pending
 
 class QueryJob(Base):
     __tablename__ = "query_jobs"
@@ -117,6 +118,8 @@ class QueryJob(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    is_active = Column(Boolean, default=True) # For 24h cleanup
+    is_active = Column(Boolean, default=True)       # For 24h cleanup
+    pending_action = Column(JSON, nullable=True)     # Tool args awaiting human approval
+    checkpoint_ns = Column(String, nullable=True)    # LangGraph checkpoint namespace
 
     user = relationship("User", backref="query_jobs")

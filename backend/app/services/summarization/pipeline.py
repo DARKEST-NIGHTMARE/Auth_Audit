@@ -6,13 +6,11 @@ import re
 from typing import List, Optional, Dict, Any
 try:
     from langsmith import traceable
-    print("✅ [DEBUG] LangSmith: Pipeline tracing active.")
 except ImportError:
     def traceable(name=None, run_type=None, **kwargs):
         def decorator(func):
             return func
         return decorator
-    print("❌ [DEBUG] LangSmith: Pipeline tracing inactive (module missing).")
 
 from app.logger import get_logger
 from .ai_clients import GeminiClient, generate_text
@@ -35,6 +33,56 @@ class SummarizationPipeline:
         self.parser = QueryParser()
         self.prompt_builder = PromptBuilder()
         self._summary_cache: Dict[str, dict] = {}
+        # LangGraph agent — lazy-loaded on first query
+        self._graph = None
+
+    async def _get_graph(self):
+        """Async lazy-loader for the LangGraph agent."""
+        if self._graph is None:
+            try:
+                from .graph.graphs import get_main_graph
+                self._graph = await get_main_graph()
+                logger.info("LangGraph agent initialized.")
+            except Exception as e:
+                logger.error(f"LangGraph initialization failed: {e}. Falling back to legacy pipeline.")
+        return self._graph
+
+    def _build_graph_state(self, text: str, folders: list, access_token: str,
+                           refresh_token: str = None, pre_chunks: list = None) -> dict:
+        """Build the initial GraphState from a query and context."""
+        parsed = self.parser.parse(text)
+        resolved_items = []
+        for m in (parsed.mentions or []):
+            matched = self._resolve_mention(m, folders)
+            if matched:
+                resolved_items.append({"id": matched["id"], "name": matched["name"],
+                                       "type": "folder" if matched["is_folder"] else "file"})
+        if not resolved_items:
+            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
+            if implicit:
+                resolved_items.append({"id": implicit["id"], "name": implicit["name"],
+                                       "type": "folder" if implicit["is_folder"] else "file"})
+        intent_map = {"summarize": "summarize", "question": "question", "general": "question"}
+        return {
+            "query": text,
+            "intent": intent_map.get(parsed.intent.value, "question"),
+            "resolved_items": resolved_items,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "retrieved_chunks": pre_chunks or [],
+            "retry_count": 0,
+            "max_retries": 3,
+            "research_steps": [],
+            "search_queries": [],
+            "research_iteration": 0,
+            "tool_results": [],
+            "validation_errors": [],
+            "token_budget_used": 0,
+            "context_truncated": False,
+            "fallback_triggered": False,
+            "cache_hit": False,
+            "messages": [],
+        }
 
     def _parse_llm_json(self, text: str) -> dict:
         """Robustly extracts JSON data from AI provider responses."""
@@ -189,11 +237,25 @@ class SummarizationPipeline:
 
             doc_type = await self._classify_document_type(text)
             chunks = self.chunker.chunk_text(text, file_id, file_name)
-            self.vector_store.add_chunks(chunks, folder_id=folder_id, last_modified=drive_modified)
-            
+            self.vector_store.add_chunks(
+                chunks,
+                folder_id=folder_id,
+                last_modified=drive_modified,
+            )
+
             self._summary_cache[f"{file_id}_type"] = doc_type
             self._summary_cache.pop(file_id, None)
-            return {"status": "indexed", "file": file_name, "chunks": len(chunks)}
+
+            # Invalidate QueryCache so stale summaries are not returned
+            try:
+                from .graph.cache import query_cache
+                cache_key = query_cache.make_key(file_name, [file_id], [])
+                await query_cache.invalidate_summary(cache_key)
+            except Exception:
+                pass  # Cache invalidation is best-effort
+
+            return {"status": "indexed", "file": file_name, "chunks": len(chunks),
+                    "doc_type": doc_type.value if hasattr(doc_type, "value") else str(doc_type)}
         except Exception as e:
             logger.error(f"Ingest failure for {file_id}: {e}")
             return {"status": "error", "error": str(e)}
@@ -268,44 +330,86 @@ class SummarizationPipeline:
             logger.error(f"Folder ingest error: {e}")
             return {"status": "error", "error": str(e), "all_folder_ids": [folder_id]}
 
-    @traceable(name="Pipeline Query (Sync)", run_type="chain")
-    async def query(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
+    @traceable(name="Pipeline Query", run_type="chain")
+    async def query(
+        self,
+        text: str,
+        folders: list,
+        access_token: str,
+        refresh_token: str = None,
+        user_id: str = None,
+    ) -> dict:
+        """Main entry point — delegates to the LangGraph agent."""
+        graph = await self._get_graph()
+        if graph is None:
+            logger.warning("LangGraph unavailable. Using legacy pipeline.")
+            return await self._legacy_query(text, folders, access_token, refresh_token)
+
+        # Ingest any unindexed files first
         parsed = self.parser.parse(text)
         resolved_items = []
-        if parsed.mentions:
-            for m in parsed.mentions:
-                matched = self._resolve_mention(m, folders)
-                if matched:
-                    resolved_items.append({"id": matched["id"], "name": matched["name"], "type": "folder" if matched["is_folder"] else "file"})
-
+        for m in (parsed.mentions or []):
+            matched = self._resolve_mention(m, folders)
+            if matched:
+                resolved_items.append({"id": matched["id"], "name": matched["name"],
+                                       "type": "folder" if matched["is_folder"] else "file"})
         if not resolved_items:
-            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
+            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text or text, folders)
             if implicit:
-                resolved_items.append({"id": implicit["id"], "name": implicit["name"], "type": "folder" if implicit["is_folder"] else "file"})
+                resolved_items.append({"id": implicit["id"], "name": implicit["name"],
+                                       "type": "folder" if implicit["is_folder"] else "file"})
 
-        if not resolved_items:
-            query_str = parsed.remaining_text if parsed.remaining_text else text
-            return await self._answer_question(query_str, [], [], folder_id=None)
+        # ── Conversation Memory: resolve follow-up context ──────────────
+        conversation_history = ""
+        if user_id:
+            try:
+                from .graph.memory import conversation_memory
+                resolved_items = await conversation_memory.resolve_implicit_context(
+                    user_id=str(user_id),
+                    query=text,
+                    current_resolved_items=resolved_items,
+                )
+                history_turns = await conversation_memory.get_history(str(user_id))
+                conversation_history = conversation_memory.build_history_context(history_turns)
+            except Exception as e:
+                logger.warning(f"Memory resolve failed: {e}")
 
-        all_folder_ids = []
         for item in resolved_items:
             if item["type"] == "folder":
-                res = await self.ingest_folder(item["id"], access_token, refresh_token)
-                if "all_folder_ids" in res:
-                    all_folder_ids.extend(res["all_folder_ids"])
+                await self.ingest_folder(item["id"], access_token, refresh_token)
             elif not self.vector_store.is_file_indexed(item["id"]):
                 await self.ingest_file(item["id"], item["name"], access_token, refresh_token)
-        
-        main_item = resolved_items[0]
-        if parsed.intent == Intent.SUMMARIZE:
-            if main_item["type"] == "folder":
-                return await self._summarize_folder(main_item["id"], main_item["name"], access_token, refresh_token, all_folder_ids=all_folder_ids)
-            return await self._summarize_file(main_item["id"], main_item["name"])
-        
-        all_ids = [it["id"] for it in resolved_items]
-        all_names = [it["name"] for it in resolved_items]
-        target_folders = all_folder_ids if main_item["type"] == "folder" else None
-        return await self._answer_question(parsed.remaining_text, all_ids, all_names, folder_id=target_folders)
+
+        state = self._build_graph_state(text, folders, access_token, refresh_token)
+        state["user_id"] = str(user_id) if user_id else None
+        state["conversation_history"] = conversation_history
+        state["resolved_items"] = resolved_items  # Use memory-resolved items
+
+        result = await graph.ainvoke(state)
+        final = result.get("final_result") or {"answer": "No result produced.", "sources": []}
+
+        # ── Record this turn in memory ──────────────────────────────────
+        if user_id:
+            try:
+                from .graph.memory import conversation_memory
+                parsed_res = {}
+                try:
+                    import json as _json
+                    parsed_res = _json.loads(final.get("answer", "{}"))
+                except Exception:
+                    pass
+                await conversation_memory.record_turn(
+                    user_id=str(user_id),
+                    query=text,
+                    resolved_items=resolved_items,
+                    doc_type=final.get("type"),
+                    summary=parsed_res.get("summary", ""),
+                    source_files=[s.get("file", "") for s in final.get("sources", [])],
+                )
+            except Exception as e:
+                logger.warning(f"Memory record failed: {e}")
+
+        return final
 
     def _fuzzy_match_text_to_items(self, text: str, items: list) -> Optional[dict]:
         if not text or len(text) < 3: return None
@@ -491,8 +595,46 @@ class SummarizationPipeline:
             "intent": "summarize" if "summarize" in query.lower() else "question"
         }
 
+    async def _legacy_query(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
+        """Legacy linear pipeline — used only if LangGraph fails to load."""
+        parsed = self.parser.parse(text)
+        resolved_items = []
+        if parsed.mentions:
+            for m in parsed.mentions:
+                matched = self._resolve_mention(m, folders)
+                if matched:
+                    resolved_items.append({"id": matched["id"], "name": matched["name"],
+                                           "type": "folder" if matched["is_folder"] else "file"})
+        if not resolved_items:
+            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
+            if implicit:
+                resolved_items.append({"id": implicit["id"], "name": implicit["name"],
+                                       "type": "folder" if implicit["is_folder"] else "file"})
+        if not resolved_items:
+            return await self._answer_question(parsed.remaining_text or text, [], [], folder_id=None)
+        all_folder_ids = []
+        for item in resolved_items:
+            if item["type"] == "folder":
+                res = await self.ingest_folder(item["id"], access_token, refresh_token)
+                if "all_folder_ids" in res:
+                    all_folder_ids.extend(res["all_folder_ids"])
+            elif not self.vector_store.is_file_indexed(item["id"]):
+                await self.ingest_file(item["id"], item["name"], access_token, refresh_token)
+        main_item = resolved_items[0]
+        if parsed.intent == Intent.SUMMARIZE:
+            if main_item["type"] == "folder":
+                return await self._summarize_folder(main_item["id"], main_item["name"],
+                                                     access_token, refresh_token,
+                                                     all_folder_ids=all_folder_ids)
+            return await self._summarize_file(main_item["id"], main_item["name"])
+        all_ids = [it["id"] for it in resolved_items]
+        all_names = [it["name"] for it in resolved_items]
+        target_folders = all_folder_ids if main_item["type"] == "folder" else None
+        return await self._answer_question(parsed.remaining_text, all_ids, all_names,
+                                           folder_id=target_folders)
+
     @traceable(name="Resolve Context", run_type="chain")
-    async def get_query_context(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
+    async def get_query_context(self, text: str, folders: list, access_token: str, refresh_token: str = None, user_id: str = None) -> dict:
         """
         API-side entry point: resolves mentions, ingests if needed, and retrieves top 5 chunks.
         Returns a 'Job Package' for the worker.

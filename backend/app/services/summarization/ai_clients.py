@@ -5,13 +5,11 @@ import asyncio
 from typing import List, Optional
 try:
     from langsmith import traceable
-    print("✅ [DEBUG] LangSmith: Module found. Tracing is active.")
 except ImportError:
     def traceable(name=None, run_type=None, **kwargs):
         def decorator(func):
             return func
         return decorator
-    print("❌ [DEBUG] LangSmith: Module NOT found. Using no-op fallback.")
 
 from app.core.config import settings
 from app.logger import get_logger
