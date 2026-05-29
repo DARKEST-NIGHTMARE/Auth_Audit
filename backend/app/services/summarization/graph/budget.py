@@ -17,7 +17,7 @@ class TokenBudgetManager:
     """
     # Conservative safe limits (actual - 20% buffer)
     BUDGET_MAP = {
-        "cerebras": 7_000,    # llama3.1-8b actual: 8192
+        "cerebras": 50_000,   # modern Cerebras hosted models support much larger context windows
         "gemini":   28_000,   # gemini-2.0-flash actual: 32K
         "local":    2_000,    # Local extractive fallback
     }

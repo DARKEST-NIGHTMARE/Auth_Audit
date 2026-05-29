@@ -62,8 +62,7 @@ class GraphState(TypedDict, total=False):
     tool_results: List[Dict[str, Any]]      # Results from tool calls
     human_approved: Optional[bool]          # For human-in-the-loop actions
 
-    # ── Checkpointing ───────────────────────────────────────────────────
-    checkpoint_id: Optional[str]            # LangGraph thread_id (= job_id from DB)
+
 
     # ── Output ──────────────────────────────────────────────────────────
     final_result: Optional[Dict[str, Any]]  # Final packaged response

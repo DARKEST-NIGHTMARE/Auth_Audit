@@ -16,6 +16,13 @@ from .routers import auth, google_drive, summarization
 setup_logging(level=settings.log_level if hasattr(settings, "log_level") else "INFO")
 logger = get_logger(__name__)
 
+# Re-apply logger filters now that all engines/clients are imported
+import logging as _logging
+_logging.getLogger("sqlalchemy").setLevel(_logging.WARNING)
+_logging.getLogger("sqlalchemy.engine").setLevel(_logging.WARNING)
+_logging.getLogger("httpx").setLevel(_logging.ERROR)
+_logging.getLogger("google_auth_httplib2").setLevel(_logging.WARNING)
+
 app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="static"), name="static")

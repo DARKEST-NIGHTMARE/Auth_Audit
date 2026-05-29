@@ -211,10 +211,13 @@ async def compress_context(state: GraphState) -> Dict:
     for chunk in chunks:
         try:
             prompt = COMPRESS_PROMPT.format(text=chunk["document"])
-            compressed_text, _, _ = await provider_governor.generate(
+            compressed_text, used_provider, _ = await provider_governor.generate(
                 prompt, COMPRESSION_SYSTEM
             )
-            compressed_chunks.append({**chunk, "document": compressed_text})
+            if used_provider == "local":
+                compressed_chunks.append(chunk)
+            else:
+                compressed_chunks.append({**chunk, "document": compressed_text})
         except Exception:
             compressed_chunks.append(chunk)  # Keep original on failure
 

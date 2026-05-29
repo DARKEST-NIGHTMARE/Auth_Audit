@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     cerebras_api_key: str = ""
     generation_provider: str = "cerebras"  # "gemini" or "cerebras"
-    cerebras_model: str = "llama3.1-8b"
+    cerebras_model: str = "gpt-oss-120b"
     
     # LangSmith Observability
     langchain_tracing_v2: bool = False

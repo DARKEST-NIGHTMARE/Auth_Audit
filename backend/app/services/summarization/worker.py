@@ -6,7 +6,16 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from sqlalchemy.future import select
+# pyrefly: ignore [missing-import]
 from sqlalchemy import update
+
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(name=None, run_type=None, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 from ...core.database import AsyncSessionLocal
 from ...core.task_manager import task_manager
@@ -14,7 +23,7 @@ from ...models import QueryJob, QueryJobStatus
 
 logger = logging.getLogger(__name__)
 
-
+@traceable(name="Worker Process Job", run_type="chain")
 async def process_job(job_data: dict):
     """
     Main worker coroutine for a single job.
@@ -87,6 +96,10 @@ async def process_job(job_data: dict):
         finally:
             task_manager.mark_job_done()
 
+@traceable(name="LangGraph Agentic Flow", run_type="chain")
+async def _traced_graph_invoke(graph, state: dict, config: dict) -> dict:
+    """Helper to ensure the graph invocation is traced by LangSmith."""
+    return await graph.ainvoke(state, config=config)
 
 async def _run_graph(job_data: dict) -> dict:
     """
@@ -139,12 +152,8 @@ async def _run_graph(job_data: dict) -> dict:
             "tags": [f"user:{job_data.get('user_id')}", f"intent:{intent}"]
         }
 
-        @traceable(name="LangGraph Agentic Flow", run_type="chain")
-        async def run_agent():
-            return await graph.ainvoke(state, config=config)
-
         try:
-            result_state = await run_agent()
+            result_state = await _traced_graph_invoke(graph, state, config)
 
             # Check if the graph paused at the execute_tool interrupt
             graph_state = await graph.aget_state(config)

@@ -185,8 +185,8 @@ def build_main_graph(checkpointer=None):
         },
     )
 
-    # ── Self-correction loops back to generation ────────────────────────
-    workflow.add_edge("self_correct",    "generate_summary")
+    # ── Self-correction validates the corrected draft directly ─────────────
+    workflow.add_edge("self_correct",    "validate_output")
     workflow.add_edge("local_fallback",  "finalize_output")
 
     # ── Final output → END ──────────────────────────────────────────────

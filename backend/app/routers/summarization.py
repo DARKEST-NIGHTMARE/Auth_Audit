@@ -10,6 +10,14 @@ from pydantic import BaseModel
 from typing import Optional, List
 import json
 
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(name=None, run_type=None, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 from app.core.database import get_db
 from app.models import User, QueryJob, QueryJobStatus
 from app.core.dependencies import get_current_db_user
@@ -62,6 +70,7 @@ class AutocompleteItem(BaseModel):
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.post("/query", response_model=QueryJobResponse)
+@traceable(name="API: Handle Query", run_type="chain")
 async def handle_query(
     request: QueryRequest,
     current_user: User = Depends(get_current_db_user),

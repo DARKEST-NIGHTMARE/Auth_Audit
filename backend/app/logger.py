@@ -57,8 +57,30 @@ def setup_logging(level: str = "INFO") -> None:
     handler.setFormatter(JSONFormatter())
     root_logger.addHandler(handler)
 
-    # Keep uvicorn's own access logs but silence noisy SQLAlchemy echoing
+    # ── Silence noisy third-party loggers ──────────────────────────────────────
+    # SQLAlchemy: suppress all SQL echo (SELECT, INSERT, COMMIT, BEGIN, etc.)
+    logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.dialects").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.orm").setLevel(logging.WARNING)
+
+    # Google auth: suppress token refresh info messages
+    logging.getLogger("google_auth_httplib2").setLevel(logging.WARNING)
+    logging.getLogger("google.auth").setLevel(logging.WARNING)
+
+    # httpx: suppress per-request HTTP logs (e.g. Cerebras, Gemini calls)
+    # Keep ERROR so failed requests still surface
+    logging.getLogger("httpx").setLevel(logging.ERROR)
+    logging.getLogger("httpcore").setLevel(logging.ERROR)
+
+    # LangChain/LangSmith: suppress verbose internal tracing logs
+    logging.getLogger("langchain").setLevel(logging.WARNING)
+    logging.getLogger("langsmith").setLevel(logging.WARNING)
+    logging.getLogger("langgraph").setLevel(logging.WARNING)
+
+    # uvicorn access logs: keep INFO
     logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
 
