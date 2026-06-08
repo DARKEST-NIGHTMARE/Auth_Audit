@@ -574,21 +574,47 @@ _NODE_LABELS = {
 @router.get("/stream/{job_id}")
 async def stream_job_progress(
     job_id: str,
-    current_user: User = Depends(get_current_db_user),
-    db: AsyncSession = Depends(get_db)
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    token: Optional[str] = None,          # query-param fallback for EventSource
 ):
     """
     Server-Sent Events (SSE) endpoint for real-time graph node progress.
-
-    Client usage (JavaScript):
-        const evtSource = new EventSource('/api/summarize/stream/{job_id}');
-        evtSource.onmessage = (e) => console.log(JSON.parse(e.data));
+    Accepts Bearer token via Authorization header OR ?token= query param
+    (EventSource cannot set headers, so query param is required for browser SSE).
 
     Each event is a JSON object:
         {"node": "retrieve_context", "label": "Retrieving relevant context...", "done": false}
         {"node": "finalize_output",  "label": "Finalizing output...",           "done": true,
          "result": {...}}
     """
+    import jwt as _jwt
+    from app.core.config import settings as _settings
+
+    # ── Resolve token: header first, then query param ──────────────────
+    raw_token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        raw_token = auth_header[7:]
+    elif token:
+        raw_token = token
+
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing authentication token.")
+
+    try:
+        payload = _jwt.decode(raw_token, _settings.secret_key, algorithms=[_settings.algorithm])
+        email = payload.get("sub")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+    from sqlalchemy.orm import selectinload
+    user_stmt = select(User).options(selectinload(User.clio_connection)).where(User.email == email)
+    user_res = await db.execute(user_stmt)
+    current_user = user_res.scalars().first()
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
     stmt = select(QueryJob).where(
         QueryJob.id == job_id,
         QueryJob.user_id == current_user.id

@@ -2,6 +2,121 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import { summarizationApi } from "../../services/summarizationApi";
 
+// ── Gemini-style thinking animation ──────────────────────────────────────────
+const THINKING_PHRASES = [
+    "Understanding the context",
+    "Analyzing your documents",
+    "Retrieving relevant chunks",
+    "Compressing context",
+    "Generating insights",
+    "Synthesizing information",
+    "Validating the output",
+    "Almost there",
+];
+
+// currentLabel: live SSE label (string) or null → falls back to timed cycling
+const GeminiThinking = ({ currentLabel = null }) => {
+    const [phraseIdx, setPhraseIdx] = useState(0);
+    const [fade, setFade] = useState(true);
+    const [liveFade, setLiveFade] = useState(true);
+    const prevLabel = useRef(null);
+
+    // Timer-based cycling — only used when no live label
+    useEffect(() => {
+        if (currentLabel !== null) return; // SSE is driving, skip timer
+        const interval = setInterval(() => {
+            setFade(false);
+            setTimeout(() => {
+                setPhraseIdx(i => (i + 1) % THINKING_PHRASES.length);
+                setFade(true);
+            }, 300);
+        }, 2200);
+        return () => clearInterval(interval);
+    }, [currentLabel]);
+
+    // Fade transition when SSE label changes
+    useEffect(() => {
+        if (currentLabel === null) return;
+        if (currentLabel !== prevLabel.current) {
+            setLiveFade(false);
+            const t = setTimeout(() => setLiveFade(true), 250);
+            prevLabel.current = currentLabel;
+            return () => clearTimeout(t);
+        }
+    }, [currentLabel]);
+
+    const displayText = currentLabel !== null
+        ? currentLabel
+        : THINKING_PHRASES[phraseIdx];
+    const opacity = currentLabel !== null ? (liveFade ? 1 : 0) : (fade ? 1 : 0);
+
+    return (
+        <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "14px",
+            padding: "14px 18px",
+            borderRadius: "16px 16px 16px 4px",
+            background: "rgba(255,255,255,0.05)",
+            border: "1px solid rgba(255,255,255,0.08)",
+        }}>
+            {/*
+             * 3-phase loop:
+             *  Phase 1 (0–25%):  triangle → converge to center
+             *  Phase 2 (25–80%): spread to horizontal row + typing bounce
+             *  Phase 3 (80–100%): converge to center → back to triangle
+             */}
+            <div style={{
+                position: "relative",
+                width: "44px",
+                height: "32px",
+                flexShrink: 0,
+            }}>
+                {/* Dot 1 — indigo: top of triangle → left typer */}
+                <span style={{
+                    position: "absolute",
+                    top: "50%", left: "50%",
+                    width: "8px", height: "8px",
+                    marginTop: "-4px", marginLeft: "-4px",
+                    borderRadius: "50%",
+                    background: "#818cf8",
+                    animation: "triDot1 2.4s ease-in-out infinite",
+                }} />
+                {/* Dot 2 — violet: bottom-right → center typer */}
+                <span style={{
+                    position: "absolute",
+                    top: "50%", left: "50%",
+                    width: "8px", height: "8px",
+                    marginTop: "-4px", marginLeft: "-4px",
+                    borderRadius: "50%",
+                    background: "#c084fc",
+                    animation: "triDot2 2.4s ease-in-out infinite",
+                }} />
+                {/* Dot 3 — sky: bottom-left → right typer */}
+                <span style={{
+                    position: "absolute",
+                    top: "50%", left: "50%",
+                    width: "8px", height: "8px",
+                    marginTop: "-4px", marginLeft: "-4px",
+                    borderRadius: "50%",
+                    background: "#38bdf8",
+                    animation: "triDot3 2.4s ease-in-out infinite",
+                }} />
+            </div>
+
+            <span style={{
+                fontSize: "0.9rem",
+                color: currentLabel ? "#C4B5FD" : "#A0AEC0", // purple tint for live labels
+                opacity,
+                transition: "opacity 0.25s ease",
+                userSelect: "none",
+            }}>
+                {displayText}
+            </span>
+        </div>
+    );
+};
+
 const AssistantSuggestions = ({ questions, onQuery, loading, contextFile }) => {
     const [showAll, setShowAll] = useState(false);
 
@@ -125,8 +240,10 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
     const [loading, setLoading] = useState(false);
     const [suggestions, setSuggestions] = useState([]);
     const [showSuggestions, setShowSuggestions] = useState(false);
+    const [thinkingLabel, setThinkingLabel] = useState(null); // live SSE label
     const messagesEndRef = useRef(null);
     const inputRef = useRef(null);
+    const sseRef = useRef(null); // holds active EventSource
 
     useEffect(() => {
         summarizationApi.getStatus().catch(() => { });
@@ -219,7 +336,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         let userMsg = (typeof overrideMsg === "string" ? overrideMsg : input).trim();
         if (!userMsg || loading) return;
 
-        // Auto-inject context for suggestions (Requirement: Click Behavior)
+        // Auto-inject context for suggestions
         if (typeof overrideMsg === "string" && !userMsg.includes("@")) {
             const targetContext = contextFile || folderName;
             if (targetContext) {
@@ -229,61 +346,135 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
         }
         setShowSuggestions(false);
         setSuggestions([]);
-        setInput(""); 
+        setInput("");
+        setThinkingLabel(null);
 
         const userMsgId = Date.now();
         setMessages(prev => [...prev, { id: userMsgId, role: "user", content: userMsg }]);
         setLoading(true);
 
+        const assistantMsgId = userMsgId + 1;
+        setMessages(prev => [...prev, {
+            id: assistantMsgId,
+            role: "assistant",
+            content: "⏳ *Processing your request...*",
+            sources: []
+        }]);
+
         try {
-            // 1. Submit Query (Asynchronous Receipt)
+            // 1. Enqueue the job
             const enqueueRes = await summarizationApi.query(userMsg);
             const jobId = enqueueRes.job_id;
 
-            // 2. Add placeholder message for assistant
-            const assistantMsgId = userMsgId + 1;
-            setMessages(prev => [...prev, {
-                id: assistantMsgId,
-                role: "assistant",
-                content: "⏳ *Processing your request...*",
-                sources: []
-            }]);
+            // 2. Connect SSE stream for live node labels
+            const token = localStorage.getItem("token");
+            const baseUrl = process.env.REACT_APP_API_URL || "";
+            const sseUrl = `${baseUrl}/api/summarize/stream/${jobId}${
+                token ? `?token=${encodeURIComponent(token)}` : ""
+            }`;
 
-            // 3. Polling Loop
+            await new Promise((resolve, reject) => {
+                // Close any stale SSE connection
+                if (sseRef.current) sseRef.current.close();
+
+                const es = new EventSource(sseUrl);
+                sseRef.current = es;
+
+                // Fallback: if SSE takes >5 s to connect, fall back to polling
+                const connectTimeout = setTimeout(() => {
+                    es.close();
+                    sseRef.current = null;
+                    // silent — polling below will resolve
+                    resolve("polling");
+                }, 5000);
+
+                es.onmessage = (evt) => {
+                    clearTimeout(connectTimeout);
+                    try {
+                        const data = JSON.parse(evt.data);
+
+                        if (data.error) {
+                            es.close();
+                            sseRef.current = null;
+                            resolve("polling"); // fall through to polling
+                            return;
+                        }
+
+                        // Update the live thinking label
+                        if (data.label && !data.done) {
+                            setThinkingLabel(data.label);
+                        }
+
+                        if (data.done) {
+                            es.close();
+                            sseRef.current = null;
+                            setThinkingLabel(null);
+
+                            if (data.result) {
+                                // SSE gave us the final result directly
+                                const ans = data.result?.answer
+                                    ?? JSON.stringify(data.result);
+                                setMessages(prev => prev.map(m =>
+                                    m.id === assistantMsgId
+                                        ? { ...m, content: ans, sources: data.result?.sources || [], type: data.result?.type }
+                                        : m
+                                ));
+                                resolve("done");
+                            } else {
+                                // finalize_output fired but no inline result → poll once
+                                resolve("polling");
+                            }
+                        }
+                    } catch (e) {
+                        // JSON parse error — ignore and keep streaming
+                    }
+                };
+
+                es.onerror = () => {
+                    clearTimeout(connectTimeout);
+                    es.close();
+                    sseRef.current = null;
+                    resolve("polling"); // degrade gracefully
+                };
+            });
+
+            // 3. Polling fallback (runs if SSE didn't deliver final result inline)
             let attempts = 0;
-            const maxAttempts = 90; // 3 minutes total polling
+            const maxAttempts = 90;
             while (attempts < maxAttempts) {
                 const result = await summarizationApi.getResult(jobId);
-                
+
                 if (result.status === "completed") {
-                    setMessages(prev => prev.map(m => m.id === assistantMsgId ? {
-                        ...m,
-                        content: result.answer,
-                        sources: result.sources || [],
-                        type: result.type || "general_document"
-                    } : m));
+                    setThinkingLabel(null);
+                    setMessages(prev => prev.map(m =>
+                        m.id === assistantMsgId
+                            ? { ...m, content: result.answer, sources: result.sources || [], type: result.type || "general_document" }
+                            : m
+                    ));
                     break;
                 } else if (result.status === "failed") {
                     throw new Error(result.error || "Generation failed.");
                 }
 
-                // Wait 2 seconds before next poll
                 await new Promise(r => setTimeout(r, 2000));
                 attempts++;
             }
 
             if (attempts >= maxAttempts) {
-                throw new Error("Request timed out. The worker is busy, but your request will continue processing in the background.");
+                throw new Error("Request timed out. The worker is busy — your request will continue in the background.");
             }
 
         } catch (err) {
             const detail = err?.response?.data?.detail || err.message || "Something went wrong.";
+            setThinkingLabel(null);
             setMessages(prev => [...prev, {
                 role: "assistant",
                 content: `❌ Error: ${detail}`,
                 sources: [],
             }]);
         } finally {
+            if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
+            setThinkingLabel(null);
             setLoading(false);
         }
     };
@@ -561,14 +752,7 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
 
                 {loading && (
                     <div style={{ display: "flex", justifyContent: "flex-start" }}>
-                        <div style={{
-                            padding: "14px 18px", borderRadius: "16px 16px 16px 4px",
-                            background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)",
-                            color: "#A0AEC0", fontSize: "0.9rem"
-                        }}>
-                            <span className="typing-dots">Analyzing documents</span>
-                            <span style={{ animation: "pulse 1.5s infinite" }}> ...</span>
-                        </div>
+                        <GeminiThinking currentLabel={thinkingLabel} />
                     </div>
                 )}
                 <div ref={messagesEndRef} />
@@ -642,6 +826,50 @@ const FileExplorer = ({ onClose, folderName, folderId }) => {
 
             <style>{`
                 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+                /*
+                 * triDot1: top of triangle (0,-13) → center → left typer (-14,0) → bounce → center → triangle
+                 * triDot2: bottom-right (11,6)    → center → stay (0,0) middle typer → bounce → triangle
+                 * triDot3: bottom-left (-11,6)    → center → right typer (14,0) → bounce → center → triangle
+                 *
+                 * Bounce is staggered: dot1 leads, dot2 +5%, dot3 +10%
+                 */
+
+                @keyframes triDot1 {
+                    0%   { transform: translate(0px,   -13px); }  /* triangle: top */
+                    25%  { transform: translate(0px,   0px);   }  /* converge */
+                    36%  { transform: translate(-14px, 0px);   }  /* line: left  */
+                    46%  { transform: translate(-14px, -8px);  }  /* bounce ↑ */
+                    54%  { transform: translate(-14px, 0px);   }  /* down */
+                    63%  { transform: translate(-14px, -8px);  }  /* bounce ↑ */
+                    71%  { transform: translate(-14px, 0px);   }  /* down */
+                    82%  { transform: translate(0px,   0px);   }  /* converge */
+                    100% { transform: translate(0px,   -13px); }  /* triangle: top */
+                }
+
+                @keyframes triDot2 {
+                    0%   { transform: translate(11px,  6px);  }   /* triangle: bottom-right */
+                    25%  { transform: translate(0px,   0px);  }   /* converge */
+                    36%  { transform: translate(0px,   0px);  }   /* already center (middle) */
+                    51%  { transform: translate(0px,   -8px); }   /* bounce ↑ (+5% lag) */
+                    59%  { transform: translate(0px,   0px);  }   /* down */
+                    68%  { transform: translate(0px,   -8px); }   /* bounce ↑ */
+                    76%  { transform: translate(0px,   0px);  }   /* down */
+                    82%  { transform: translate(0px,   0px);  }   /* hold */
+                    100% { transform: translate(11px,  6px);  }   /* triangle: bottom-right */
+                }
+
+                @keyframes triDot3 {
+                    0%   { transform: translate(-11px, 6px);  }   /* triangle: bottom-left */
+                    25%  { transform: translate(0px,   0px);  }   /* converge */
+                    36%  { transform: translate(14px,  0px);  }   /* line: right */
+                    56%  { transform: translate(14px,  -8px); }   /* bounce ↑ (+10% lag) */
+                    64%  { transform: translate(14px,  0px);  }   /* down */
+                    73%  { transform: translate(14px,  -8px); }   /* bounce ↑ */
+                    81%  { transform: translate(14px,  0px);  }   /* down */
+                    88%  { transform: translate(0px,   0px);  }   /* converge */
+                    100% { transform: translate(-11px, 6px);  }   /* triangle: bottom-left */
+                }
             `}</style>
         </div>
     );
