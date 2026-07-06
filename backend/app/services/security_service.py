@@ -28,6 +28,17 @@ class SecurityService:
         await db.commit()
         await db.refresh(new_event)
 
+        username = None
+        user_email = None
+        if new_event.user_id:
+            from ..models import User
+            user_stmt = select(User).where(User.id == new_event.user_id)
+            user_res = await db.execute(user_stmt)
+            db_user = user_res.scalars().first()
+            if db_user:
+                username = db_user.name
+                user_email = db_user.email
+
         try:
             event_type_str = new_event.event_type.value if hasattr(new_event.event_type, 'value') else str(new_event.event_type)
 
@@ -35,6 +46,8 @@ class SecurityService:
                 "id": new_event.id,
                 "event_type": event_type_str,
                 "user_id": new_event.user_id,
+                "username": username,
+                "user_email": user_email,
                 "ip_address": new_event.ip_address,
                 "event_metadata": new_event.event_metadata,
                 "created_at": new_event.created_at.isoformat()

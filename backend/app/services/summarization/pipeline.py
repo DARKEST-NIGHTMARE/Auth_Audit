@@ -47,21 +47,32 @@ class SummarizationPipeline:
                 logger.error(f"LangGraph initialization failed: {e}. Falling back to legacy pipeline.")
         return self._graph
 
-    def _build_graph_state(self, text: str, folders: list, access_token: str,
-                           refresh_token: str = None, pre_chunks: list = None) -> dict:
-        """Build the initial GraphState from a query and context."""
-        parsed = self.parser.parse(text)
+    def _resolve_items_from_query(self, text: str, folders: list, parsed) -> list:
+        """Helper to resolve mentions and fuzzy matches from a query against a list of folder/file items."""
         resolved_items = []
         for m in (parsed.mentions or []):
             matched = self._resolve_mention(m, folders)
             if matched:
-                resolved_items.append({"id": matched["id"], "name": matched["name"],
-                                       "type": "folder" if matched["is_folder"] else "file"})
+                resolved_items.append({
+                    "id": matched["id"],
+                    "name": matched["name"],
+                    "type": "folder" if matched["is_folder"] else "file"
+                })
         if not resolved_items:
-            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
+            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text or text, folders)
             if implicit:
-                resolved_items.append({"id": implicit["id"], "name": implicit["name"],
-                                       "type": "folder" if implicit["is_folder"] else "file"})
+                resolved_items.append({
+                    "id": implicit["id"],
+                    "name": implicit["name"],
+                    "type": "folder" if implicit["is_folder"] else "file"
+                })
+        return resolved_items
+
+    def _build_graph_state(self, text: str, folders: list, access_token: str,
+                           refresh_token: str = None, pre_chunks: list = None) -> dict:
+        """Build the initial GraphState from a query and context."""
+        parsed = self.parser.parse(text)
+        resolved_items = self._resolve_items_from_query(text, folders, parsed)
         intent_map = {"summarize": "summarize", "question": "question", "general": "question"}
         return {
             "query": text,
@@ -347,17 +358,7 @@ class SummarizationPipeline:
 
         # Ingest any unindexed files first
         parsed = self.parser.parse(text)
-        resolved_items = []
-        for m in (parsed.mentions or []):
-            matched = self._resolve_mention(m, folders)
-            if matched:
-                resolved_items.append({"id": matched["id"], "name": matched["name"],
-                                       "type": "folder" if matched["is_folder"] else "file"})
-        if not resolved_items:
-            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text or text, folders)
-            if implicit:
-                resolved_items.append({"id": implicit["id"], "name": implicit["name"],
-                                       "type": "folder" if implicit["is_folder"] else "file"})
+        resolved_items = self._resolve_items_from_query(text, folders, parsed)
 
         # ── Conversation Memory: resolve follow-up context ──────────────
         conversation_history = ""
@@ -598,18 +599,7 @@ class SummarizationPipeline:
     async def _legacy_query(self, text: str, folders: list, access_token: str, refresh_token: str = None) -> dict:
         """Legacy linear pipeline — used only if LangGraph fails to load."""
         parsed = self.parser.parse(text)
-        resolved_items = []
-        if parsed.mentions:
-            for m in parsed.mentions:
-                matched = self._resolve_mention(m, folders)
-                if matched:
-                    resolved_items.append({"id": matched["id"], "name": matched["name"],
-                                           "type": "folder" if matched["is_folder"] else "file"})
-        if not resolved_items:
-            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
-            if implicit:
-                resolved_items.append({"id": implicit["id"], "name": implicit["name"],
-                                       "type": "folder" if implicit["is_folder"] else "file"})
+        resolved_items = self._resolve_items_from_query(text, folders, parsed)
         if not resolved_items:
             return await self._answer_question(parsed.remaining_text or text, [], [], folder_id=None)
         all_folder_ids = []
@@ -640,17 +630,7 @@ class SummarizationPipeline:
         Returns a 'Job Package' for the worker.
         """
         parsed = self.parser.parse(text)
-        resolved_items = []
-        if parsed.mentions:
-            for m in parsed.mentions:
-                matched = self._resolve_mention(m, folders)
-                if matched:
-                    resolved_items.append({"id": matched["id"], "name": matched["name"], "type": "folder" if matched["is_folder"] else "file"})
-
-        if not resolved_items:
-            implicit = self._fuzzy_match_text_to_items(parsed.remaining_text, folders)
-            if implicit:
-                resolved_items.append({"id": implicit["id"], "name": implicit["name"], "type": "folder" if implicit["is_folder"] else "file"})
+        resolved_items = self._resolve_items_from_query(text, folders, parsed)
 
         # Ingest missing items
         all_folder_ids = []

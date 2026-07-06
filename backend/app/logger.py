@@ -1,5 +1,5 @@
 """
-Central logging configuration for the Portal Sentinel backend.
+Central logging configuration for the Login Auth Audit backend.
 Import `logger` from here in every module.
 
 Usage:
@@ -80,8 +80,24 @@ def setup_logging(level: str = "INFO") -> None:
     logging.getLogger("langsmith").setLevel(logging.WARNING)
     logging.getLogger("langgraph").setLevel(logging.WARNING)
 
-    # uvicorn access logs: keep INFO
-    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    # uvicorn access logs: keep INFO but mask ?token= values so JWTs are
+    # never written to log files in plaintext.
+    class _MaskTokenFilter(logging.Filter):
+        import re as _re
+        _pattern = _re.compile(r"([\?&]token=)[^&\s\"']+", _re.IGNORECASE)
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.args:
+                # Uvicorn formats the access line via %-style args; mask in each arg
+                record.args = tuple(
+                    self._pattern.sub(r"\1[REDACTED]", str(a)) if isinstance(a, str) else a
+                    for a in record.args
+                )
+            return True
+
+    uvicorn_access = logging.getLogger("uvicorn.access")
+    uvicorn_access.setLevel(logging.INFO)
+    uvicorn_access.addFilter(_MaskTokenFilter())
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -120,7 +120,11 @@ async def handle_query(
         db.add(new_job)
         await db.commit()
 
-        # 4. Enqueue for Worker
+        # 4. Enqueue for Worker — classify job type for dual-queue routing
+        resolved_items = context_package.get("resolved_items", [])
+        # Fast: single-file Q&A or fewer than 3 items. Slow: bulk folder ingestion.
+        is_fast = len(resolved_items) < 3
+
         job_payload = {
             "job_id": job_id,
             "user_id": current_user.id,
@@ -128,9 +132,9 @@ async def handle_query(
             "chunks": context_package["chunks"],
             "access_token": current_user.google_drive_access_token,
             "refresh_token": current_user.google_drive_refresh_token,
-            "resolved_items": context_package.get("resolved_items", []),
+            "resolved_items": resolved_items,
         }
-        await task_manager.enqueue_job(job_payload)
+        await task_manager.enqueue_job(job_payload, is_fast=is_fast)
 
         return QueryJobResponse(
             job_id=job_id,
@@ -149,7 +153,11 @@ async def get_query_result(
     db: AsyncSession = Depends(get_db)
 ):
     """Poll for the result of a specific summarization job."""
-    stmt = select(QueryJob).where(QueryJob.id == job_id, QueryJob.user_id == current_user.id)
+    stmt = select(QueryJob).where(
+        QueryJob.id == job_id,
+        QueryJob.user_id == current_user.id,
+        QueryJob.is_active == True,  # Exclude soft-deleted jobs
+    )
     res = await db.execute(stmt)
     job = res.scalars().first()
 
@@ -191,7 +199,8 @@ async def get_chat_history(
 ):
     """Fetch the user's recent AI chat history."""
     stmt = select(QueryJob).where(
-        QueryJob.user_id == current_user.id
+        QueryJob.user_id == current_user.id,
+        QueryJob.is_active == True,  # Exclude soft-deleted jobs
     ).order_by(QueryJob.created_at.asc()).limit(limit)
     res = await db.execute(stmt)
     jobs = res.scalars().all()
@@ -463,7 +472,8 @@ async def approve_action(
 
     stmt = select(QueryJob).where(
         QueryJob.id == job_id,
-        QueryJob.user_id == current_user.id
+        QueryJob.user_id == current_user.id,
+        QueryJob.is_active == True,  # Exclude soft-deleted jobs
     )
     res = await db.execute(stmt)
     job = res.scalars().first()
@@ -527,7 +537,8 @@ async def reject_action(
     stmt = select(QueryJob).where(
         QueryJob.id == job_id,
         QueryJob.user_id == current_user.id,
-        QueryJob.status == QueryJobStatus.AWAITING_APPROVAL
+        QueryJob.status == QueryJobStatus.AWAITING_APPROVAL,
+        QueryJob.is_active == True,  # Exclude soft-deleted jobs
     )
     res = await db.execute(stmt)
     job = res.scalars().first()
@@ -617,7 +628,8 @@ async def stream_job_progress(
 
     stmt = select(QueryJob).where(
         QueryJob.id == job_id,
-        QueryJob.user_id == current_user.id
+        QueryJob.user_id == current_user.id,
+        QueryJob.is_active == True,  # Exclude soft-deleted jobs
     )
     res = await db.execute(stmt)
     job = res.scalars().first()

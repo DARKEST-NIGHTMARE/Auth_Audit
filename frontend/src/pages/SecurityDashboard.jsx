@@ -104,28 +104,52 @@ const SecurityDashboard = () => {
     }, [page, eventTypeFilter, user]);
 
     useEffect(() => {
-        if (!user || user.role !== "admin") return;
+        // Role stored as uppercase "ADMIN" in the database
+        if (!user || user.role !== "ADMIN") return;
+
+        const token = localStorage.getItem("token");
+        if (!token) return;
 
         const backendUrl = process.env.REACT_APP_API_URL || "http://localhost:8081";
-        const wsUrl = backendUrl.replace(/^http/, "ws") + "/api/admin/security/ws";
+        // Browser WebSockets cannot send custom headers, so we pass the JWT
+        // as a query parameter — the backend reads it from ?token=
+        const wsUrl = backendUrl.replace(/^http/, "ws") +
+            `/api/admin/security/ws?token=${encodeURIComponent(token)}`;
         const ws = new WebSocket(wsUrl);
 
-        ws.onmessage = (event) => {
-            const newEvent = JSON.parse(event.data);
+        ws.onopen = () => {
+            console.debug("[SecurityWS] Connected to live security feed.");
+        };
 
-            if (newEvent.event_type === "SUSPICIOUS_ACTIVITY" || newEvent.event_type === "ACCOUNT_LOCKED") {
-                setAlerts(prevAlerts => [newEvent, ...prevAlerts].slice(0, 10));
-            }
-            setLogs(prevLogs => {
-                if (eventTypeFilter && newEvent.event_type !== eventTypeFilter) {
-                    return prevLogs;
+        ws.onerror = (err) => {
+            console.warn("[SecurityWS] Connection error:", err);
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const newEvent = JSON.parse(event.data);
+                // Skip error/rejection messages from the server
+                if (newEvent.error) {
+                    console.warn("[SecurityWS] Server rejected connection:", newEvent.error);
+                    ws.close();
+                    return;
                 }
-                return [newEvent, ...prevLogs].slice(0, limit);
-            });
+                if (newEvent.event_type === "SUSPICIOUS_ACTIVITY" || newEvent.event_type === "ACCOUNT_LOCKED") {
+                    setAlerts(prevAlerts => [newEvent, ...prevAlerts].slice(0, 10));
+                }
+                setLogs(prevLogs => {
+                    if (eventTypeFilter && newEvent.event_type !== eventTypeFilter) {
+                        return prevLogs;
+                    }
+                    return [newEvent, ...prevLogs].slice(0, limit);
+                });
+            } catch (e) {
+                console.warn("[SecurityWS] Failed to parse message:", e);
+            }
         };
 
         return () => {
-            if (ws.readyState === 1) ws.close();
+            if (ws.readyState === WebSocket.OPEN) ws.close();
         };
     }, [eventTypeFilter, limit, user]);
 

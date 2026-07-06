@@ -72,24 +72,43 @@ async def startup():
     from .services.summarization.worker import worker_loop
     asyncio.create_task(worker_loop())
 
-    # Start the periodic cleanup task (every hour)
+    # Start the periodic cleanup task (every hour, two-phase soft delete)
     async def cleanup_loop():
-        from sqlalchemy import delete
+        from sqlalchemy import delete, update as sa_update
         from datetime import datetime, timedelta, timezone
         from .models import QueryJob
         while True:
             try:
+                now = datetime.now(timezone.utc)
                 async with engine.begin() as conn:
-                    # Delete jobs older than 24 hours
-                    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+                    # Phase 1: Soft-delete — hide jobs older than 24h from users
+                    # is_active=False makes them invisible to all API endpoints
+                    # but the data is still physically in the DB for recovery
+                    soft_cutoff = now - timedelta(hours=24)
                     await conn.execute(
-                        delete(QueryJob).where(QueryJob.created_at < cutoff)
+                        sa_update(QueryJob)
+                        .where(
+                            QueryJob.created_at < soft_cutoff,
+                            QueryJob.is_active == True,
+                        )
+                        .values(is_active=False)
                     )
-                logger.info("Cleanup task: Removed jobs older than 24h.")
+
+                    # Phase 2: Hard-delete — permanently remove jobs older than 48h
+                    # By this point they have been soft-deleted for at least 24h
+                    hard_cutoff = now - timedelta(hours=48)
+                    await conn.execute(
+                        delete(QueryJob).where(
+                            QueryJob.created_at < hard_cutoff,
+                            QueryJob.is_active == False,
+                        )
+                    )
+
+                logger.info("Cleanup task: soft-deleted 24h+ jobs, hard-deleted 48h+ jobs.")
             except Exception as e:
                 logger.error(f"Cleanup task error: {e}")
-            await asyncio.sleep(3600) # Wait 1 hour
-            
+            await asyncio.sleep(3600)  # Run every hour
+
     asyncio.create_task(cleanup_loop())
 
     logger.info("application_startup", extra={"env": "development"})

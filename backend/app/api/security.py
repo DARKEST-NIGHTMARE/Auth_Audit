@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
+from sqlalchemy.orm import joinedload
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 from fastapi.security import HTTPBearer
@@ -20,35 +21,16 @@ router = APIRouter(
 )
 
 async def require_admin(
-    current_user = Depends(dependencies.get_current_user),
-    db: AsyncSession = Depends(database.get_db), 
-    token = Depends(token_auth_scheme)
+    current_user: models.User = Depends(dependencies.get_current_db_user),
 ):
-    
-    role = getattr(current_user, 'role', None)
-    if not role and isinstance(current_user, dict):
-        role = current_user.get('role')
-
-    if not role:
-        email = getattr(current_user, 'email', None) 
-        if not email and isinstance(current_user, dict):
-            email = current_user.get('email') or current_user.get('sub') 
-
-        if email:
-            stmt = select(models.User).where(models.User.email == email)
-            result = await db.execute(stmt)
-            db_user = result.scalars().first()
-            if db_user:
-                role = db_user.role
-
-    logger.debug("admin_role_check", extra={"role": str(role)})
-
-    if role != models.UserRole.ADMIN:
+    """
+    Enforces admin role check by relying on get_current_db_user dependency.
+    """
+    if current_user.role != models.UserRole.ADMIN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Access denied. Your role is '{role}'. Admin privileges required."
+            detail="Access denied. Admin privileges required."
         )
-        
     return current_user
 
 @router.get("/events", response_model=List[schemas.SecurityEventOut])
@@ -60,7 +42,10 @@ async def get_security_events(
     db: AsyncSession = Depends(database.get_db),
     admin = Depends(require_admin) 
 ):
-    stmt = select(models.SecurityEvent)
+    # Use joinedload to fetch user details in the same query
+    stmt = select(models.SecurityEvent).options(
+        joinedload(models.SecurityEvent.user)
+    )
 
     if event_type:
         stmt = stmt.where(models.SecurityEvent.event_type == event_type)
@@ -73,11 +58,7 @@ async def get_security_events(
     events = result.scalars().all()
 
     for event in events:
-        if event.user_id:
-            user_stmt = select(models.User).where(models.User.id == event.user_id)
-            user_result = await db.execute(user_stmt)
-            user = user_result.scalars().first()
-            event.username = user.name if user else "Unknown"
+        event.username = event.user.name if event.user else "Unknown"
 
     return events
 
@@ -89,45 +70,36 @@ async def get_active_users(
 ):
     time_threshold = datetime.now(timezone.utc) - timedelta(days=days)
 
+    # Perform a single database select joining SecurityEvent and User
     stmt = select(
-        models.SecurityEvent.user_id,
-        func.max(models.SecurityEvent.created_at).label("last_seen"),
-        func.count(models.SecurityEvent.id).label("total_logins")
+        models.SecurityEvent,
+        models.User
+    ).join(
+        models.User, models.SecurityEvent.user_id == models.User.id
     ).where(
         models.SecurityEvent.event_type == models.EventType.ACTIVE_SESSION,
-        models.SecurityEvent.created_at >= time_threshold,
-        models.SecurityEvent.user_id.isnot(None)
-    ).group_by(models.SecurityEvent.user_id)
+        models.SecurityEvent.created_at >= time_threshold
+    ).order_by(desc(models.SecurityEvent.created_at))
 
     result = await db.execute(stmt)
-    recent_events = result.all()
+    rows = result.all()
 
-    activity_list = []
-    for row in recent_events:
-        user_id, last_seen, total_logins = row
-
-        user_stmt = select(models.User).where(models.User.id == user_id)
-        user_result = await db.execute(user_stmt)
-        user = user_result.scalars().first()
-
-        if user:
-            ip_stmt = select(models.SecurityEvent).where(
-                models.SecurityEvent.user_id == user.id,
-                models.SecurityEvent.event_type == models.EventType.ACTIVE_SESSION
-            ).order_by(desc(models.SecurityEvent.created_at))
-            
-            ip_result = await db.execute(ip_stmt)
-            last_login_event = ip_result.scalars().first()
-
-            activity_list.append({
-                "user_id": user.id,
+    # Group the active users in Python
+    user_data = {}
+    for event, user in rows:
+        uid = user.id
+        if uid not in user_data:
+            user_data[uid] = {
+                "user_id": uid,
                 "name": user.name,
                 "email": user.email,
-                "last_seen": last_seen,
-                "last_ip": last_login_event.ip_address if last_login_event else None,
-                "total_logins": total_logins
-            })
+                "last_seen": event.created_at,
+                "last_ip": event.ip_address,
+                "total_logins": 0
+            }
+        user_data[uid]["total_logins"] += 1
 
+    activity_list = list(user_data.values())
     activity_list.sort(key=lambda x: x["last_seen"], reverse=True)
     return activity_list
 
@@ -136,17 +108,20 @@ async def get_all_sessions(
     db: AsyncSession = Depends(database.get_db),
     admin = Depends(require_admin)
 ):
-    stmt = select(models.UserSession).where(models.UserSession.is_active == True).order_by(desc(models.UserSession.last_active))
+    # Eager load user relationship in one SQL statement
+    stmt = select(models.UserSession).options(
+        joinedload(models.UserSession.user)
+    ).where(
+        models.UserSession.is_active == True
+    ).order_by(desc(models.UserSession.last_active))
+
     result = await db.execute(stmt)
     sessions = result.scalars().all()
     
     for session in sessions:
-        user_stmt = select(models.User).where(models.User.id == session.user_id)
-        user_result = await db.execute(user_stmt)
-        user = user_result.scalars().first()
-        if user:
-            session.user_name = user.name
-            session.user_email = user.email
+        if session.user:
+            session.user_name = session.user.name
+            session.user_email = session.user.email
 
     return sessions
 
@@ -168,7 +143,39 @@ async def revoke_user_session(
     return {"message": "Session revoked successfully"}
 
 @router.websocket("/ws")
-async def websocket_security_endpoint(websocket: WebSocket):
+async def websocket_security_endpoint(
+    websocket: WebSocket,
+    token: Optional[str] = Query(None),
+    db: AsyncSession = Depends(database.get_db)
+):
+    # Accept and authenticate the WebSocket connection using query parameter token
+    if not token:
+        await websocket.accept()
+        await websocket.send_json({"error": "Unauthorized: Missing token"})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    try:
+        import jwt as _jwt
+        payload = _jwt.decode(token, dependencies.JWT_SECRET, algorithms=[dependencies.ALGORITHM])
+        email = payload.get("sub")
+        
+        # Verify admin privilege status of the user
+        stmt = select(models.User).where(models.User.email == email)
+        result = await db.execute(stmt)
+        db_user = result.scalars().first()
+        if not db_user or db_user.role != models.UserRole.ADMIN:
+            await websocket.accept()
+            await websocket.send_json({"error": "Forbidden: Admin access required"})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
+    except Exception as e:
+        await websocket.accept()
+        await websocket.send_json({"error": f"Unauthorized: {str(e)}"})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     await security_ws_manager.connect(websocket)
     try:
         while True:

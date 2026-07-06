@@ -94,7 +94,7 @@ async def process_job(job_data: dict):
             except Exception:
                 pass
         finally:
-            task_manager.mark_job_done()
+            task_manager.mark_job_done(user_id=str(user_id))
 
 @traceable(name="LangGraph Agentic Flow", run_type="chain")
 async def _traced_graph_invoke(graph, state: dict, config: dict) -> dict:
